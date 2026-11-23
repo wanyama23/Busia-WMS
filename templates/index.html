@@ -1,0 +1,119 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container-fluid">
+  <!-- Top summary row -->
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100">
+        <div class="card-body text-center">
+          <div class="card-title small text-muted">Active SKUs</div>
+          <div id="dash_active_skus" class="display-6 fw-bold">{{ stats.active_skus if stats and stats.active_skus is defined else (items|length) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100">
+        <div class="card-body text-center">
+          <div class="card-title small text-muted">Units on hand</div>
+          <div id="dash_units_on_hand" class="display-6 fw-bold">{{ stats.units_on_hand if stats and stats.units_on_hand is defined else (items|sum(attribute='on_hand') if items else 0) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100">
+        <div class="card-body text-center">
+          <div class="card-title small text-muted">Low stock alerts</div>
+          <div id="dash_low_stock_alerts" class="display-6 fw-bold text-warning">{{ low_alerts|length }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100">
+        <div class="card-body text-center">
+          <div class="card-title small text-muted">Recent movements</div>
+          <div id="dash_recent_count" class="display-6 fw-bold">{{ stats.recent_movements if stats and stats.recent_movements is defined else 0 }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reorder alerts and right column -->
+  <div class="row">
+    <div class="col-lg-8">
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <strong>Reorder alerts</strong>
+          <small class="text-muted">Items at or below reorder level</small>
+        </div>
+
+        <ul id="dash_reorder_alerts" class="list-group list-group-flush">
+          {% if low_alerts %}
+            {% for it in low_alerts %}
+              <li class="list-group-item d-flex justify-content-between align-items-center">
+                <div class="me-3">
+                  <div class="fw-bold">{{ it.name }}</div>
+                  <div class="small text-muted">{{ it.sku }} · reorder {{ it.reorder_level }}</div>
+                </div>
+                <div class="text-end">
+                  <div class="small text-muted">{{ it.on_hand|default(0) }} {{ it.unit or '' }}</div>
+                  {% if endpoint_exists('item_detail') %}
+                    <a class="btn btn-sm btn-outline-primary mt-2" href="{{ url_for('item_detail', sku=it.sku) }}">View</a>
+                  {% else %}
+                    <a class="btn btn-sm btn-outline-primary mt-2" href="#">View</a>
+                  {% endif %}
+                </div>
+              </li>
+            {% endfor %}
+          {% else %}
+            <li class="list-group-item">
+              <div class="text-muted">No reorder alerts. All items above reorder levels.</div>
+            </li>
+          {% endif %}
+        </ul>
+      </div>
+    </div>
+
+    <div class="col-lg-4">
+      <!-- Quick actions -->
+      <div class="card mb-3">
+        <div class="card-header"><strong>Quick actions</strong></div>
+        <div class="card-body">
+          {% if endpoint_exists('receive') %}
+            <a class="btn btn-primary w-100 mb-2" href="{{ url_for('receive') }}">Receive stock</a>
+          {% else %}
+            <a class="btn btn-primary w-100 mb-2" href="#">Receive stock</a>
+          {% endif %}
+
+          {% if endpoint_exists('issue') %}
+            <a class="btn btn-outline-secondary w-100 mb-2" href="{{ url_for('issue') }}">Issue stock</a>
+          {% else %}
+            <a class="btn btn-outline-secondary w-100 mb-2" href="#">Issue stock</a>
+          {% endif %}
+
+          {% if endpoint_exists('adjust_stock') %}
+            <a class="btn btn-outline-secondary w-100" href="{{ url_for('adjust_stock', sku='') }}">Adjust stock</a>
+          {% else %}
+            <a class="btn btn-outline-secondary w-100" href="#">Adjust stock</a>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><strong>Recent movements</strong></div>
+        <ul id="dash_recent_movements" class="list-group list-group-flush">
+          {% if recent_movements %}
+            {% for m in recent_movements %}
+              <li class="list-group-item">{{ m.when }} — {{ m.sku }}: {{ m.qty }} ({{ m.txn_type }})</li>
+            {% endfor %}
+          {% else %}
+            <li class="list-group-item text-muted">No recent movements.</li>
+          {% endif %}
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

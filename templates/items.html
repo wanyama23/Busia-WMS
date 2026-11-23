@@ -1,0 +1,447 @@
+{# templates/items.html - full file (replace your existing file) #}
+{% extends "layout.html" %}
+{% block title %}Items — Master list of SKUs{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <!-- Top row: search, category filter, actions -->
+  <form id="itemsFilterForm" class="d-flex align-items-center gap-2 mb-3" method="get" action="{{ url_for('items') }}">
+    <div class="flex-grow-1">
+      <input id="itemSearch" name="q" class="form-control form-control-lg" placeholder="Search SKU or name…" value="{{ request.args.get('q','') }}" autocomplete="off" />
+    </div>
+
+    <div style="min-width:220px;">
+      <select id="categoryFilter" name="category" class="form-select">
+        <option value="">All categories</option>
+        {# categories expected as list of dicts: {name: 'Food', count: 12} #}
+        {% for c in categories %}
+          {% set cname = c.name if c.name is defined else (c['name'] if c['name'] is defined else c) %}
+          {% set ccount = c.count if c.count is defined else (c['count'] if c['count'] is defined else '') %}
+          <option value="{{ cname }}" {% if selected_category == cname %}selected{% endif %}>
+            {{ cname }}{% if ccount != '' %} ({{ ccount }}){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="d-flex gap-2">
+      <button type="submit" class="btn btn-primary">Apply</button>
+      <button type="button" id="clearFilters" class="btn btn-outline-secondary">Clear</button>
+      <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#itemModal">+ New</button>
+      {% if endpoint_exists('export_items') %}
+        <a class="btn btn-outline-secondary" href="{{ url_for('export_items') }}">Export CSV</a>
+      {% elif endpoint_exists('export_locations') %}
+        <a class="btn btn-outline-secondary" href="{{ url_for('export_locations') }}">Export CSV</a>
+      {% else %}
+        <a class="btn btn-outline-secondary" href="#">Export CSV</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <!-- Summary cards -->
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100 shadow-sm">
+        <div class="card-body">
+          <div class="card-title small text-muted">Active SKUs</div>
+          <div class="display-6 fw-bold">{{ stats.active_skus if stats and stats.active_skus is defined else (items|length) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100 shadow-sm">
+        <div class="card-body">
+          <div class="card-title small text-muted">Units on hand</div>
+          <div class="display-6 fw-bold">{{ stats.units_on_hand if stats and stats.units_on_hand is defined else (items|sum(attribute='on_hand') if items else 0) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100 shadow-sm">
+        <div class="card-body">
+          <div class="card-title small text-muted">Low stock alerts</div>
+          <div class="display-6 fw-bold text-danger">{{ low_alerts|length }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <div class="card summary-card h-100 shadow-sm">
+        <div class="card-body">
+          <div class="card-title small text-muted">Recent movements</div>
+          <div class="display-6 fw-bold">{{ stats.recent_movements if stats and stats.recent_movements is defined else (recent_movements|length if recent_movements else 0) }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <!-- Left: items grid -->
+    <div class="col-lg-8">
+      <div id="itemsList" class="row g-3">
+        {% for it in items %}
+          {% set on_hand = (it.on_hand | default(0) | int) %}
+          {% set reorder = (it.reorder_level if it.reorder_level is not none else None) %}
+          <div class="col-12 col-sm-6 col-md-4 item-card" data-sku="{{ it.sku|lower }}" data-name="{{ it.name|lower }}" data-category="{{ (it.category or '')|lower }}">
+            <div class="card h-100 shadow-sm">
+              <div class="card-body d-flex flex-column">
+                <div class="d-flex justify-content-between align-items-start">
+                  <div class="me-2">
+                    <div class="fw-bold text-truncate" title="{{ it.name }}">{{ it.name }}</div>
+                    <div class="text-muted small">{{ it.sku }}{% if it.unit %} · {{ it.unit }}{% endif %}{% if it.category %} · {{ it.category }}{% endif %}</div>
+                  </div>
+                  {% if reorder is not none and on_hand <= reorder %}
+                    <span class="badge bg-danger small ms-2">Low</span>
+                  {% elif reorder is not none %}
+                    <span class="badge bg-success small ms-2">OK</span>
+                  {% endif %}
+                </div>
+
+                <div class="mt-3 mb-2 d-flex justify-content-between align-items-end mt-auto">
+                  <div>
+                    <div class="h5 mb-0">{{ on_hand }} <span class="text-muted small">{{ it.unit or '' }}</span></div>
+                    {% if reorder is not none %}
+                      <div class="small text-secondary">Reorder: {{ reorder }}</div>
+                      {% set pct = (on_hand / (reorder if reorder>0 else 1) * 100) | round(0) %}
+                      <div class="progress mt-1" style="height:8px;">
+                        <div class="progress-bar {% if on_hand <= reorder %}bg-danger{% else %}bg-success{% endif %}" role="progressbar" style="width: {{ [pct,100]|min }}%;" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100"></div>
+                      </div>
+                    {% endif %}
+                  </div>
+
+                  <div class="text-end">
+                    {% if endpoint_exists('item_detail') %}
+                      <a class="btn btn-sm btn-outline-primary mb-1" href="{{ url_for('item_detail', sku=it.sku) }}">Open</a>
+                    {% else %}
+                      <a class="btn btn-sm btn-outline-primary mb-1" href="#">Open</a>
+                    {% endif %}
+                    <div>
+                      {% if endpoint_exists('receive') %}
+                        <a class="btn btn-sm btn-outline-success me-1" href="{{ url_for('receive', sku=it.sku) }}">Receive</a>
+                      {% else %}
+                        <a class="btn btn-sm btn-outline-success me-1" href="#">Receive</a>
+                      {% endif %}
+                      {% if endpoint_exists('issue') %}
+                        <a class="btn btn-sm btn-outline-warning" href="{{ url_for('issue', sku=it.sku) }}">Issue</a>
+                      {% else %}
+                        <a class="btn btn-sm btn-outline-warning" href="#">Issue</a>
+                      {% endif %}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        {% else %}
+          <div class="col-12">
+            <div class="alert alert-info mb-0">No items found for the selected filters.</div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Right: low stock alerts + recent movements -->
+    <div class="col-lg-4">
+      <div class="card mb-3 shadow-sm">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <strong>Low stock alerts</strong>
+          <span class="badge bg-danger">{{ low_alerts|length }}</span>
+        </div>
+        <div class="list-group list-group-flush">
+          {% if low_alerts %}
+            {% for it in low_alerts %}
+              <div class="list-group-item d-flex justify-content-between align-items-start">
+                <div>
+                  <div class="fw-bold">{{ it.name }}</div>
+                  <div class="small text-muted">{{ it.sku }} · {{ it.on_hand|default(0) }} {{ it.unit or '' }}</div>
+                </div>
+                <div class="text-end">
+                  <div class="small text-secondary">Reorder: {{ it.reorder_level }}</div>
+                  {% if endpoint_exists('item_detail') %}
+                    <a class="btn btn-sm btn-outline-primary mt-2" href="{{ url_for('item_detail', sku=it.sku) }}">View</a>
+                  {% else %}
+                    <a class="btn btn-sm btn-outline-primary mt-2" href="#">View</a>
+                  {% endif %}
+                </div>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="list-group-item">
+              <div class="text-muted">No reorder alerts. All items above reorder levels.</div>
+            </div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="card shadow-sm">
+        <div class="card-header"><strong>Recent movements</strong></div>
+        <div class="card-body small">
+          {% if recent_movements %}
+            <ul class="list-unstyled mb-0">
+              {% for m in recent_movements %}
+                <li class="mb-1"><strong>{{ m.when }}</strong> — <span class="text-monospace">{{ m.sku }}</span>: {{ m.qty }} ({{ m.txn_type }})</li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <div class="text-muted">No recent movements.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# New item modal (keeps your existing fields; JS below handles submission) #}
+<div class="modal fade" id="itemModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form id="itemForm" class="p-3" novalidate>
+        <div class="modal-header">
+          <h6 class="modal-title">New item</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+
+        <div class="modal-body">
+          <div class="mb-2">
+            <label class="form-label small">SKU *</label>
+            <input id="i_sku" name="sku" class="form-control" placeholder="SKU" required pattern="^[A-Za-z0-9_-]+$">
+            <div class="form-text small text-muted">Allowed: letters, numbers, dash, underscore.</div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label small">Name *</label>
+            <input id="i_name" name="name" class="form-control" placeholder="Name" required>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label small">Unit</label>
+            <select id="i_unit_select" class="form-select" name="unit_select">
+              {% for u in units %}
+                <option value="{{ u }}" {% if u == 'pcs' %}selected{% endif %}>{{ u }}</option>
+              {% endfor %}
+              <option value="__other__">Other…</option>
+            </select>
+            <input id="i_unit_other" name="unit_other" class="form-control mt-2 d-none" placeholder="Enter custom unit (e.g. jerrycan)">
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label small">Category</label>
+            <select id="i_cat_select" class="form-select" name="category_select">
+              {% for c in categories %}
+                {% set cname = c.name if c.name is defined else c %}
+                <option value="{{ cname }}" {% if cname == selected_category %}selected{% endif %}>{{ cname }}</option>
+              {% endfor %}
+              <option value="__other__">Other…</option>
+            </select>
+            <input id="i_cat_other" name="category_other" class="form-control mt-2 d-none" placeholder="Enter custom category">
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label small">Reorder level</label>
+            <input id="i_reorder" name="reorder_level" type="number" class="form-control" value="0" min="0">
+          </div>
+
+          <div id="itemFormAlert" class="alert alert-danger d-none" role="alert"></div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{# Client JS: filter behavior, category auto-submit, clear button, modal helpers, AJAX create item, and client-side search #}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  // Elements
+  const filterForm = document.getElementById('itemsFilterForm');
+  const categorySelect = document.getElementById('categoryFilter');
+  const clearBtn = document.getElementById('clearFilters');
+  const searchInput = document.getElementById('itemSearch');
+  const itemsGrid = document.getElementById('itemsList');
+
+  // Auto-submit when category changes
+  if (categorySelect) {
+    categorySelect.addEventListener('change', () => filterForm.submit());
+  }
+
+  // Clear filters
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      const q = filterForm.querySelector('[name="q"]');
+      const cat = filterForm.querySelector('[name="category"]');
+      if (q) q.value = '';
+      if (cat) cat.value = '';
+      filterForm.submit();
+    });
+  }
+
+  // Client-side instant search (filters visible cards)
+  function filterCardsByQuery(q) {
+    const query = (q || '').trim().toLowerCase();
+    Array.from(document.querySelectorAll('.item-card')).forEach(c => {
+      const sku = c.dataset.sku || '';
+      const name = c.dataset.name || '';
+      c.style.display = (query === '' || sku.includes(query) || name.includes(query)) ? '' : 'none';
+    });
+  }
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => filterCardsByQuery(e.target.value));
+  }
+
+  // Modal: show/hide "Other" inputs for unit/category
+  const unitSelect = document.getElementById('i_unit_select');
+  const unitOther = document.getElementById('i_unit_other');
+  const catSelect = document.getElementById('i_cat_select');
+  const catOther = document.getElementById('i_cat_other');
+  const itemForm = document.getElementById('itemForm');
+  const alertBox = document.getElementById('itemFormAlert');
+  const itemModalEl = document.getElementById('itemModal');
+  const bsModal = itemModalEl ? bootstrap.Modal.getOrCreateInstance(itemModalEl) : null;
+
+  function toggleOther(selectEl, otherEl) {
+    if (!selectEl || !otherEl) return;
+    otherEl.classList.toggle('d-none', selectEl.value !== '__other__');
+    if (selectEl.value !== '__other__') otherEl.value = '';
+  }
+  if (unitSelect) unitSelect.addEventListener('change', () => toggleOther(unitSelect, unitOther));
+  if (catSelect) catSelect.addEventListener('change', () => toggleOther(catSelect, catOther));
+
+  if (itemModalEl) {
+    itemModalEl.addEventListener('show.bs.modal', function () {
+      toggleOther(unitSelect, unitOther);
+      toggleOther(catSelect, catOther);
+      if (alertBox) { alertBox.classList.add('d-none'); alertBox.textContent = ''; }
+      itemForm.reset();
+    });
+  }
+
+  // Helper to escape HTML for inserted cards
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, function (m) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m];
+    });
+  }
+
+  // Create card DOM from item object returned by server
+  function createCardHtml(item) {
+    const col = document.createElement('div');
+    col.className = 'col-12 col-sm-6 col-md-4 item-card';
+    col.dataset.sku = (item.sku || '').toLowerCase();
+    col.dataset.name = (item.name || '').toLowerCase();
+    col.dataset.category = (item.category || '').toLowerCase();
+    const on_hand = item.on_hand || 0;
+    const reorder = (item.reorder_level !== undefined && item.reorder_level !== null) ? item.reorder_level : null;
+    const below = (reorder !== null && on_hand <= reorder);
+    col.innerHTML = `
+      <div class="card h-100 shadow-sm">
+        <div class="card-body d-flex flex-column">
+          <div class="d-flex justify-content-between align-items-start">
+            <div class="me-2">
+              <div class="fw-bold text-truncate" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+              <div class="text-muted small">${escapeHtml(item.sku)}${item.unit ? ' · ' + escapeHtml(item.unit) : ''}${item.category ? ' · ' + escapeHtml(item.category) : ''}</div>
+            </div>
+            ${below ? '<span class="badge bg-danger small ms-2">Low</span>' : (reorder !== null ? '<span class="badge bg-success small ms-2">OK</span>' : '')}
+          </div>
+
+          <div class="mt-3 mb-2 d-flex justify-content-between align-items-end mt-auto">
+            <div>
+              <div class="h5 mb-0">${on_hand} <span class="text-muted small">${escapeHtml(item.unit || '')}</span></div>
+              ${reorder !== null ? '<div class="small text-secondary">Reorder: ' + (reorder || 0) + '</div>' : ''}
+            </div>
+
+            <div class="text-end">
+              <a class="btn btn-sm btn-outline-primary mb-1" href="/item/${encodeURIComponent(item.sku)}">Open</a>
+              <div>
+                <a class="btn btn-sm btn-outline-success me-1" href="/receive/${encodeURIComponent(item.sku)}">Receive</a>
+                <a class="btn btn-sm btn-outline-warning" href="/issue/${encodeURIComponent(item.sku)}">Issue</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    return col;
+  }
+
+  // Submit new item via AJAX to /api/items and insert card on success
+  if (itemForm) {
+    itemForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      if (!alertBox) return;
+      alertBox.classList.add('d-none');
+      alertBox.textContent = '';
+
+      const sku = (itemForm.querySelector('[name="sku"]').value || '').trim();
+      const name = (itemForm.querySelector('[name="name"]').value || '').trim();
+      const unit = (unitSelect && unitSelect.value === '__other__') ? (unitOther.value || '').trim() : (unitSelect ? unitSelect.value : 'pcs');
+      const category = (catSelect && catSelect.value === '__other__') ? (catOther.value || '').trim() : (catSelect ? catSelect.value : '');
+      const reorder_raw = itemForm.querySelector('[name="reorder_level"]').value;
+      const reorder_level = reorder_raw === '' ? null : Number(reorder_raw);
+
+      if (!sku || !name) {
+        alertBox.textContent = 'SKU and Name are required.';
+        alertBox.classList.remove('d-none');
+        return;
+      }
+      if (!unit) {
+        alertBox.textContent = 'Please select or enter a Unit.';
+        alertBox.classList.remove('d-none');
+        return;
+      }
+      if (!category) {
+        alertBox.textContent = 'Please select or enter a Category.';
+        alertBox.classList.remove('d-none');
+        return;
+      }
+
+      const payload = { sku, name, unit, category, reorder_level };
+
+      fetch('/api/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      .then(async res => {
+        const data = await res.json().catch(()=>null);
+        if (!res.ok) {
+          const msg = data && data.message ? data.message : 'Failed to create item';
+          throw new Error(msg);
+        }
+        return data;
+      })
+      .then(result => {
+        if (result && result.status === 'ok' && result.item) {
+          const newCard = createCardHtml(result.item);
+          if (itemsGrid) itemsGrid.insertBefore(newCard, itemsGrid.firstChild);
+          if (bsModal) bsModal.hide();
+        } else {
+          throw new Error((result && result.message) || 'Unexpected response from server');
+        }
+      })
+      .catch(err => {
+        alertBox.textContent = err.message || 'Server error';
+        alertBox.classList.remove('d-none');
+      });
+    });
+  }
+});
+</script>
+
+{# Optional small inline styles to keep layout tidy if your CSS file doesn't include them #}
+<style>
+.summary-card { border-radius: 8px; }
+.card.shadow-sm { box-shadow: 0 6px 18px rgba(18, 38, 63, 0.04); border: 1px solid rgba(0,0,0,0.04); }
+.item-card .card { border-radius: 8px; }
+.item-card .fw-bold { font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+.progress { background: #f1f3f5; }
+.display-6 { font-size: 1.6rem; }
+.text-monospace { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; }
+</style>
+{% endblock %}

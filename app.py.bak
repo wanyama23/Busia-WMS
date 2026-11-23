@@ -1,0 +1,4525 @@
+import os
+import csv
+import io
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session, send_file, make_response, abort
+from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from flask_wtf import CSRFProtect
+from flask_wtf.csrf import CSRFError, generate_csrf
+from flask_session import Session
+import smtplib
+from email.message import EmailMessage
+from weasyprint import HTML
+import io as _io
+from flask_wtf.csrf import generate_csrf
+# existing imports remain
+# put this once in app.py after app = Flask(...)
+from flask import current_app
+import logging
+
+
+
+# dropdown defaults used by templates and routes
+DEFAULT_UNITS = ['pcs', 'bag', 'bottle', 'pack', 'jerrycan']
+DEFAULT_CATEGORIES = ['Food', 'NFI', 'Health', 'Beverages', 'General']
+
+
+load_dotenv()
+app = Flask(__name__, template_folder='templates', static_folder='static')
+
+app.jinja_env.globals['generate_csrf'] = generate_csrf
+
+
+
+
+app.logger.setLevel(logging.DEBUG)
+
+
+@app.context_processor
+def expose_helpers():
+    def endpoint_exists(name):
+        return name in current_app.view_functions
+    return {'endpoint_exists': endpoint_exists}
+
+
+# helper for templates: check if an endpoint exists
+def endpoint_exists(name):
+    return name in app.view_functions
+app.jinja_env.globals['endpoint_exists'] = endpoint_exists
+app.jinja_env.globals['generate_csrf'] = generate_csrf
+
+
+# stable secret for CSRF/session
+app.secret_key = os.getenv('FLASK_SECRET', 'devsecret')
+
+# Session & cookie settings for local development
+app.config.update({
+    'SESSION_TYPE': 'filesystem',
+    'SESSION_COOKIE_HTTPONLY': True,
+    'SESSION_COOKIE_SAMESITE': 'Lax',
+    'SESSION_COOKIE_SECURE': False
+})
+
+# initialize server-side session and CSRF protection
+Session(app)
+csrf = CSRFProtect(app)
+
+
+
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf(e):
+    app.logger.warning("CSRFError: %s; headers=%s; body=%s",
+                       e.description, dict(request.headers), request.get_data(as_text=True))
+    return jsonify({'status':'error','message':'CSRF token missing or invalid'}), 400
+
+from flask_wtf.csrf import CSRFError
+
+@app.errorhandler(CSRFError)
+def handle_csrf(e):
+    app.logger.warning("CSRFError: %s; headers=%s; body=%s",
+                       e.description, dict(request.headers), request.get_data(as_text=True))
+    return jsonify({'status':'error','message':'CSRF token missing or invalid'}), 400
+
+
+DB_CONFIG = {
+    'user': os.getenv('DB_USER','root'),
+    'password': os.getenv('DB_PASS',''),
+    'host': os.getenv('DB_HOST','127.0.0.1'),
+    'database': os.getenv('DB_NAME','busia_wms'),
+    'autocommit': False
+}
+
+MAIL_HOST = os.getenv('MAIL_HOST')
+MAIL_PORT = int(os.getenv('MAIL_PORT', 587))
+MAIL_USER = os.getenv('MAIL_USER')
+MAIL_PASS = os.getenv('MAIL_PASS')
+MAIL_FROM = os.getenv('MAIL_FROM', MAIL_USER)
+LOW_STOCK_THRESHOLD = int(os.getenv('LOW_STOCK_THRESHOLD', 10))
+
+# --- SQLite configuration and helpers (replace MySQL parts) ---
+import sqlite3
+
+# Path to sqlite DB file (use env or default to project file)
+DB_PATH = os.getenv('SQLITE_PATH', os.path.join(os.getcwd(), 'busia_wms.sqlite3'))
+
+def get_conn():
+    """
+    Return a sqlite3.Connection with row_factory set to sqlite3.Row.
+    Use detect_types so DATETIME fields are returned as strings (or parsed if needed).
+    """
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    # enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def init_db():
+    """
+    Create tables if they don't exist. Called once at startup.
+    Note: stock_ledger.when_ts column added to match queries in your app.
+    """
+    ddl = """
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sku TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      category TEXT,
+      reorder_level INTEGER DEFAULT 0,
+      price REAL DEFAULT NULL,
+      carton_price REAL DEFAULT NULL,
+      description TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      updated_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS locations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE,
+      name TEXT NOT NULL,
+      type TEXT,
+      capacity INTEGER DEFAULT NULL,
+      notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      updated_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS suppliers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE,
+      name TEXT NOT NULL,
+      contact_name TEXT,
+      phone TEXT,
+      email TEXT,
+      address TEXT,
+      notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS customers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE,
+      name TEXT NOT NULL,
+      contact_name TEXT,
+      phone TEXT,
+      email TEXT,
+      address TEXT,
+      notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      full_name TEXT,
+      email TEXT,
+      password_hash TEXT,
+      role TEXT DEFAULT 'user',
+      is_active INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS batches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_no TEXT NOT NULL,
+      item_sku TEXT NOT NULL,
+      manufacture_date DATE DEFAULT NULL,
+      expiry_date DATE DEFAULT NULL,
+      qty INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT (datetime('now')),
+      updated_at DATETIME DEFAULT (datetime('now')),
+      UNIQUE (batch_no, item_sku),
+      FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE CASCADE ON UPDATE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      receipt_no TEXT NOT NULL UNIQUE,
+      supplier_id INTEGER DEFAULT NULL,
+      po_no TEXT DEFAULT NULL,
+      received_by TEXT DEFAULT NULL,
+      received_at DATETIME DEFAULT (datetime('now')),
+      notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS receipt_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      receipt_id INTEGER NOT NULL,
+      item_sku TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      location_id INTEGER DEFAULT NULL,
+      batch_no TEXT DEFAULT NULL,
+      line_notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY (receipt_id) REFERENCES receipts(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT,
+      FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      delivery_no TEXT NOT NULL UNIQUE,
+      order_ref TEXT DEFAULT NULL,
+      recipient TEXT DEFAULT NULL,
+      address TEXT,
+      vehicle_reg TEXT,
+      driver_name TEXT,
+      remarks TEXT,
+      created_by TEXT DEFAULT NULL,
+      created_at DATETIME DEFAULT (datetime('now')),
+      updated_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS delivery_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      delivery_id INTEGER NOT NULL,
+      item_sku TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      location_id INTEGER DEFAULT NULL,
+      batch_no TEXT DEFAULT NULL,
+      line_notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY (delivery_id) REFERENCES deliveries(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT,
+      FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sku TEXT DEFAULT NULL,
+      item_sku TEXT DEFAULT NULL,
+      qty INTEGER NOT NULL,
+      txn_type TEXT NOT NULL,
+      location_id INTEGER DEFAULT NULL,
+      from_location_id INTEGER DEFAULT NULL,
+      to_location_id INTEGER DEFAULT NULL,
+      reference TEXT DEFAULT NULL,
+      batch_no TEXT DEFAULT NULL,
+      created_by TEXT DEFAULT NULL,
+      when_ts DATETIME DEFAULT (datetime('now')),
+      notes TEXT,
+      FOREIGN KEY (from_location_id) REFERENCES locations(id) ON DELETE SET NULL,
+      FOREIGN KEY (to_location_id) REFERENCES locations(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS inventory_counts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      count_no TEXT NOT NULL UNIQUE,
+      performed_by TEXT,
+      location_id INTEGER DEFAULT NULL,
+      notes TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS inventory_count_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      count_id INTEGER NOT NULL,
+      item_sku TEXT NOT NULL,
+      counted_qty INTEGER NOT NULL,
+      expected_qty INTEGER DEFAULT NULL,
+      variance INTEGER GENERATED ALWAYS AS (counted_qty - COALESCE(expected_qty,0)) VIRTUAL,
+      notes TEXT,
+      FOREIGN KEY (count_id) REFERENCES inventory_counts(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT
+    );
+    """
+    conn = get_conn()
+    try:
+        conn.executescript(ddl)
+        conn.commit()
+    finally:
+        conn.close()
+
+# initialize DB at startup
+init_db()
+
+# --- upsert_items adapted for SQLite ---
+def upsert_items(conn, rows):
+    """
+    Insert or update multiple items using SQLite ON CONFLICT (sku) DO UPDATE.
+    Returns number of rows affected (sum of changes).
+    """
+    if not rows:
+        return 0
+
+    sql = """
+    INSERT INTO items
+      (sku, name, unit, category, reorder_level, price, carton_price, description, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT(sku) DO UPDATE SET
+      name = excluded.name,
+      unit = excluded.unit,
+      category = excluded.category,
+      reorder_level = excluded.reorder_level,
+      price = excluded.price,
+      carton_price = excluded.carton_price,
+      description = excluded.description,
+      updated_at = datetime('now')
+    """
+    params = []
+    for r in rows:
+        params.append((
+            r.get('sku'),
+            r.get('name'),
+            r.get('unit') or 'pcs',
+            r.get('category') or 'General',
+            int(r.get('reorder_level') or 0),
+            float(r.get('price')) if r.get('price') not in (None, '') else None,
+            float(r.get('carton_price')) if r.get('carton_price') not in (None, '') else None,
+            r.get('description') or ''
+        ))
+
+    cur = conn.cursor()
+    try:
+        cur.executemany(sql, params)
+        conn.commit()
+        # sqlite3.Cursor.rowcount is -1 for executemany in some versions; use total_changes
+        return conn.total_changes
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+
+
+@app.route('/seed_items', methods=['POST'])
+def seed_items():
+    if not app.debug:
+        return jsonify({'status': 'error', 'message': 'Seeding allowed only in debug mode'}), 403
+
+    default_items = [
+        {'sku':'SOAP-100G','name':'Soap 100g','unit':'bar','category':'Hygiene','reorder_level':50,'price':30.00,'carton_price':300.00,'description':'Generic soap bar','initial_qty':200},
+        {'sku':'SOAP-100G','name':'Soap 1kg','unit':'bar','category':'Hygiene',
+ 'reorder_level':50,'price':150.00,'carton_price':1500.00,
+ 'description':'Generic 1kg soap bar','initial_qty':200},
+        {'sku':'DOWNY-500ML','name':'Downy Fabric Softener 500ml','unit':'bottle','category':'Cleaning','reorder_level':20,'price':250.00,'carton_price':3000.00,'description':'Downy 500ml bottle (carton of 12)','initial_qty':60},
+        {'sku':'DOWNY-1L','name':'Downy Fabric Softener 1L','unit':'bottle','category':'Cleaning','reorder_level':15,'price':450.00,'carton_price':5400.00,'description':'Downy 1L bottle (carton of 12)','initial_qty':40},
+        {'sku':'WATER-500ML','name':'Bottled Water 500ml','unit':'bottle','category':'Beverages','reorder_level':100,'price':30.00,'carton_price':720.00,'description':'500ml bottled water (carton of 24)','initial_qty':240},
+        {'sku':'WATER-1.5L','name':'Bottled Water 1.5L','unit':'bottle','category':'Beverages','reorder_level':60,'price':80.00,'carton_price':1920.00,'description':'1.5L bottled water (carton of 24)','initial_qty':120},
+
+        # Cooking oil realistic KES prices
+        {'sku':'COOK-OIL-20L','name':'Cooking Oil 20L','unit':'jerrycan','category':'Food','reorder_level':5,'price':4200.00,'carton_price':None,'description':'Cooking oil 20L jerrycan','initial_qty':10},
+        {'sku':'COOK-OIL-10L','name':'Cooking Oil 10L','unit':'jerrycan','category':'Food','reorder_level':8,'price':2200.00,'carton_price':None,'description':'Cooking oil 10L jerrycan','initial_qty':12},
+        {'sku':'COOK-OIL-5L','name':'Cooking Oil 5L','unit':'jerrycan','category':'Food','reorder_level':12,'price':1200.00,'carton_price':None,'description':'Cooking oil 5L jerrycan','initial_qty':20},
+        {'sku':'COOK-OIL-2L','name':'Cooking Oil 2L','unit':'bottle','category':'Food','reorder_level':20,'price':350.00,'carton_price':None,'description':'Cooking oil 2L bottle','initial_qty':50},
+        {'sku':'COOK-OIL-1L','name':'Cooking Oil 1L','unit':'bottle','category':'Food','reorder_level':40,'price':190.00,'carton_price':None,'description':'Cooking oil 1L bottle','initial_qty':80},
+
+        # Staples and condiments
+        {'sku':'SUGAR-1KG','name':'Sugar 1kg','unit':'kg','category':'Food','reorder_level':30,'price':150.00,'carton_price':None,'description':'Refined sugar 1kg pack','initial_qty':100},
+        {'sku':'SALT-500G','name':'Salt 500g','unit':'pack','category':'Food','reorder_level':40,'price':40.00,'carton_price':None,'description':'Table salt 500g','initial_qty':150},
+        {'sku':'SALT-1KG','name':'Salt 1kg','unit':'kg','category':'Food','reorder_level':20,'price':70.00,'carton_price':None,'description':'Table salt 1kg','initial_qty':80},
+
+        # Seasoning and small groceries
+        {'sku':'ROYCO-50G','name':'Royco Seasoning 50g','unit':'pack','category':'Food','reorder_level':50,'price':60.00,'carton_price':None,'description':'Royco seasoning small pack','initial_qty':200},
+
+        # Snacks and biscuits
+        {'sku':'BISCUITS-200G','name':'Biscuits 200g','unit':'pack','category':'Food','reorder_level':30,'price':120.00,'carton_price':None,'description':'Assorted biscuits 200g','initial_qty':120},
+        {'sku':'KIDS-SNACKS-50G','name':'Kids Snacks 50g','unit':'pack','category':'Food','reorder_level':40,'price':50.00,'carton_price':None,'description':'Kids snack pack 50g','initial_qty':160},
+
+        # Household smalls
+        {'sku':'MATCHBOX-1','name':'Matchbox (single)','unit':'pc','category':'Household','reorder_level':200,'price':10.00,'carton_price':300.00,'description':'Single matchbox (carton of 60)','initial_qty':1000},
+        {'sku':'CANDLES-1PC','name':'Candle (single)','unit':'pc','category':'Household','reorder_level':100,'price':15.00,'carton_price':600.00,'description':'Single candle (carton of 60)','initial_qty':400},
+
+        # Baby care (Pampers) realistic KES prices
+        {'sku':'PAMPERS-S','name':'Pampers Size S','unit':'pack','category':'Baby','reorder_level':20,'price':600.00,'carton_price':None,'description':'Pampers small pack','initial_qty':40},
+        {'sku':'PAMPERS-M','name':'Pampers Size M','unit':'pack','category':'Baby','reorder_level':20,'price':750.00,'carton_price':None,'description':'Pampers medium pack','initial_qty':40},
+        {'sku':'PAMPERS-L','name':'Pampers Size L','unit':'pack','category':'Baby','reorder_level':20,'price':900.00,'carton_price':None,'description':'Pampers large pack','initial_qty':40},
+        {'sku':'PAMPERS-XL','name':'Pampers Size XL','unit':'pack','category':'Baby','reorder_level':15,'price':1100.00,'carton_price':None,'description':'Pampers XL pack','initial_qty':30}
+    ]
+
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            # 1) upsert items (ensures price fields are stored)
+            inserted = upsert_items(conn, default_items)
+
+            # 2) insert initial stock_ledger entries with price info in notes
+            ledger_sql = """
+                INSERT INTO stock_ledger
+                  (sku, item_sku, qty, txn_type, location_id, reference, batch_no, created_by, when_ts, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+            """
+            ledger_params = []
+            for it in default_items:
+                sku = it['sku']
+                qty = int(it.get('initial_qty', int(it.get('reorder_level', 10)) * 2))
+                unit_price = float(it.get('price')) if it.get('price') not in (None, '') else 0.0
+                total_value = round(unit_price * qty, 2)
+                notes = f"unit_price={unit_price:.2f}; total_value={total_value:.2f}; seeded_by=seed"
+                ledger_params.append((sku, sku, qty, 'INITIAL', None, 'seed', None, 'seed', notes))
+
+            cur.executemany(ledger_sql, ledger_params)
+            conn.commit()
+            return jsonify({
+                'status': 'ok',
+                'message': f'Seeded {len(default_items)} items and created {len(ledger_params)} initial ledger entries'
+            })
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+    except Exception:
+        if conn:
+            conn.rollback()
+        app.logger.exception("Failed to seed items and ledger")
+        return jsonify({'status': 'error', 'message': 'Failed to seed items and ledger'}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# Temporary debug route — add to app.py, restart Flask, then open /debug_db
+@app.route('/debug_db')
+def debug_db():
+    import json
+    conn = None
+    cur = None
+    out = {
+        'db_path': None,
+        'items_count': None,
+        'sample_items': [],
+        'ledger_totals_sample': []
+    }
+    try:
+        out['db_path'] = DB_PATH if 'DB_PATH' in globals() else os.getenv('SQLITE_PATH', None)
+
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+
+        # items count
+        cur.execute("SELECT COUNT(*) AS cnt FROM items")
+        row = cur.fetchone()
+        out['items_count'] = row.get('cnt', 0) if row else 0
+
+        # sample items (first 20)
+        cur.execute("SELECT sku, name, COALESCE(is_seeded,0) AS is_seeded, unit, category, reorder_level FROM items ORDER BY sku LIMIT 20")
+        out['sample_items'] = cur.fetchall() or []
+
+        # ledger totals grouped by item_sku and sku (show top 20)
+        cur.execute("""
+            SELECT COALESCE(item_sku, sku) AS key_sku, SUM(qty) AS on_hand
+            FROM stock_ledger
+            GROUP BY COALESCE(item_sku, sku)
+            ORDER BY on_hand DESC
+            LIMIT 20
+        """)
+        out['ledger_totals_sample'] = cur.fetchall() or []
+
+    except Exception as e:
+        out['error'] = str(e)
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+    return app.response_class(response=json.dumps(out, default=str, indent=2), mimetype='application/json')
+
+
+# --- add to app.py (imports near top) ---
+from datetime import datetime
+from flask import jsonify, request
+
+
+import traceback
+
+
+
+# Add near your other imports
+from datetime import datetime
+from flask import jsonify
+
+# Robust dashboard API
+@app.route('/api/dashboard', methods=['GET'])
+def api_dashboard():
+    conn = None
+    cur = None
+    # default payload values
+    payload = {
+        'active_skus': 0,
+        'units_on_hand': 0,
+        'low_stock_alerts': 0,
+        'reorder_alerts': [],
+        'recent_movements': []
+    }
+    try:
+        conn = get_conn()
+        try:
+            cur = conn.cursor(dictionary=True)
+            dict_cursor = True
+        except Exception:
+            cur = conn.cursor()
+            dict_cursor = False
+
+        # Active SKUs
+        try:
+            cur.execute("SELECT COUNT(DISTINCT sku) AS active_skus FROM items")
+            row = cur.fetchone()
+            payload['active_skus'] = int((row['active_skus'] if dict_cursor else row[0]) if row else 0)
+        except Exception as e:
+            app.logger.exception("Failed active_skus query: %s", e)
+
+        # Units on hand (sum from ledger)
+        try:
+            cur.execute("SELECT COALESCE(SUM(qty),0) AS units_on_hand FROM stock_ledger")
+            row = cur.fetchone()
+            payload['units_on_hand'] = int((row['units_on_hand'] if dict_cursor else row[0]) if row else 0)
+        except Exception as e:
+            app.logger.exception("Failed units_on_hand query: %s", e)
+
+        # Low stock alerts (safe per-item computation)
+        try:
+            cur.execute("""
+                SELECT COUNT(1) AS low_stock_alerts
+                FROM (
+                  SELECT i.sku, COALESCE(SUM(sl.qty),0) AS on_hand, COALESCE(i.reorder_level, ?) AS reorder_level
+                  FROM items i
+                  LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+                  GROUP BY i.sku, i.reorder_level
+                ) t
+                WHERE t.reorder_level IS NOT NULL AND t.on_hand <= t.reorder_level
+            """, (LOW_STOCK_THRESHOLD,))
+            row = cur.fetchone()
+            payload['low_stock_alerts'] = int((row['low_stock_alerts'] if dict_cursor else row[0]) if row else 0)
+        except Exception as e:
+            app.logger.exception("Failed low_stock_alerts query: %s", e)
+
+        # Reorder alerts details (limit 10)
+        try:
+            cur.execute("""
+                SELECT i.sku, i.name, i.unit, i.category, COALESCE(SUM(sl.qty),0) AS on_hand, COALESCE(i.reorder_level, ?) AS reorder_level
+                FROM items i
+                LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+                GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+                HAVING reorder_level IS NOT NULL AND on_hand <= reorder_level
+                ORDER BY (reorder_level - on_hand) DESC
+                LIMIT 10
+            """, (LOW_STOCK_THRESHOLD,))
+            rows = cur.fetchall() or []
+            alerts = []
+            for r in rows:
+                if dict_cursor:
+                    alerts.append({
+                        'sku': r.get('sku'),
+                        'name': r.get('name'),
+                        'unit': r.get('unit'),
+                        'category': r.get('category'),
+                        'on_hand': int(r.get('on_hand') or 0),
+                        'reorder_level': int(r.get('reorder_level') or 0)
+                    })
+                else:
+                    alerts.append({
+                        'sku': r[0], 'name': r[1], 'unit': r[2],
+                        'category': r[3], 'on_hand': int(r[4] or 0), 'reorder_level': int(r[5] or 0)
+                    })
+            payload['reorder_alerts'] = alerts
+        except Exception as e:
+            app.logger.exception("Failed reorder_alerts query: %s", e)
+            payload['reorder_alerts'] = []
+
+        # Recent movements (limit 10)
+        try:
+            cur.execute("""
+                SELECT when_ts AS ts, sku, qty, txn_type, user
+                FROM stock_ledger
+                ORDER BY when_ts DESC
+                LIMIT 10
+            """)
+            rows = cur.fetchall() or []
+            moves = []
+            for r in rows:
+                if dict_cursor:
+                    moves.append({
+                        'sku': r.get('sku'),
+                        'qty': int(r.get('qty') or 0),
+                        'type': r.get('txn_type'),
+                        'user': r.get('user'),
+                        'ts': str(r.get('ts'))
+                    })
+                else:
+                    moves.append({
+                        'sku': r[1], 'qty': int(r[2] or 0), 'type': r[3], 'user': r[4], 'ts': str(r[0])
+                    })
+            payload['recent_movements'] = moves
+        except Exception as e:
+            app.logger.exception("Failed recent_movements query: %s", e)
+            payload['recent_movements'] = []
+
+        return jsonify(payload), 200
+
+    except Exception as exc:
+        app.logger.exception("api_dashboard top-level exception: %s", exc)
+        # return safe error with no null lists
+        return jsonify({'status': 'error', 'message': 'Server error fetching dashboard', 'reorder_alerts': [], 'recent_movements': []}), 500
+    finally:
+        try:
+            if cur: cur.close()
+        except Exception:
+            pass
+        try:
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+# Replace index() with ledger-based on_hand computation for initial render
+@app.route('/')
+def index():
+    conn = None
+    cur = None
+    items = []
+    recent_movements = []
+    try:
+        conn = get_conn()
+        try:
+            cur = conn.cursor(dictionary=True)
+            dict_cursor = True
+        except Exception:
+            cur = conn.cursor()
+            dict_cursor = False
+
+        # Items: compute on_hand from stock_ledger
+        try:
+            cur.execute("""
+                SELECT
+                  i.sku,
+                  i.name,
+                  i.unit,
+                  i.category,
+                  COALESCE(SUM(sl.qty), 0) AS on_hand,
+                  COALESCE(i.reorder_level, %s) AS reorder_level
+                FROM items i
+                LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+                GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+                ORDER BY i.name ASC
+            """, (LOW_STOCK_THRESHOLD,))
+            items = cur.fetchall() or []
+        except Exception:
+            app.logger.exception("Failed items query in index()")
+            items = []
+
+        # Recent movements for initial render
+        try:
+            cur.execute("""
+                SELECT when_ts AS `when`, sku, qty, txn_type
+                FROM stock_ledger
+                ORDER BY when_ts DESC
+                LIMIT 5
+            """)
+            recent_movements = cur.fetchall() or []
+        except Exception:
+            app.logger.exception("Failed recent_movements query in index()")
+            recent_movements = []
+
+    except Exception:
+        app.logger.exception("index() top-level exception")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    low_alerts = [it for it in items if int(it.get('on_hand', 0)) <= int(it.get('reorder_level', LOW_STOCK_THRESHOLD))]
+
+    stats = {
+        'active_skus': len(items),
+        'units_on_hand': sum(int(it.get('on_hand', 0)) for it in items),
+        'recent_movements': len(recent_movements)
+    }
+
+    return render_template(
+        'index.html',
+        items=items,
+        user=session.get('username'),
+        low_alerts=low_alerts,
+        recent_movements=recent_movements,
+        stats=stats,
+        now=datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    )
+
+
+
+# -------------------------
+# Items page + API + export
+# -------------------------
+
+
+# --- Add near top of app.py (after imports) ---
+from flask import (
+    Flask, render_template, request, jsonify, redirect, url_for,
+    flash, session, make_response, current_app
+)
+import io, csv, math
+import logging
+app.logger.setLevel(logging.DEBUG)
+
+
+
+# Defaults used by templates
+DEFAULT_UNITS = ['pcs', 'bag', 'bottle', 'pack', 'jerrycan']
+DEFAULT_CATEGORIES = ['Food', 'NFI', 'Health', 'Beverages', 'General']
+
+# Context helper exposed to Jinja templates
+@app.context_processor
+def expose_helpers():
+    def endpoint_exists(name):
+        return name in current_app.view_functions
+    return {'endpoint_exists': endpoint_exists}
+
+# Utility to parse reorder level safely
+def parse_reorder_level(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s == '':
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+# -------------------------
+# Items dashboard (with category counts)
+# -------------------------
+@app.route('/items')
+def items():
+    conn = None
+    cur = None
+    items = []
+    low_alerts = []
+    recent_movements = []
+    stats = {'active_skus': 0, 'units_on_hand': 0, 'recent_movements': 0}
+    categories = []
+
+    # read filters
+    selected_category = (request.args.get('category') or '').strip() or None
+    q = (request.args.get('q') or '').strip() or None
+
+    try:
+        conn = get_conn()
+        # try dictionary cursor, fallback to normal cursor
+        try:
+            cur = conn.cursor(dictionary=True)
+            dict_cursor = True
+        except Exception:
+            cur = conn.cursor()
+            dict_cursor = False
+
+        # Build base SQL with optional search and category filter
+        base_sql = """
+            SELECT
+              i.sku,
+              i.name,
+              i.unit,
+              i.category,
+              COALESCE(i.reorder_level, %s) AS reorder_level,
+              COALESCE(SUM(sl.qty), 0) AS on_hand
+            FROM items i
+            LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+        """
+        params = [LOW_STOCK_THRESHOLD]
+
+        where_clauses = []
+        if selected_category:
+            where_clauses.append("i.category = %s")
+            params.append(selected_category)
+        if q:
+            # search by sku or name (case-insensitive for most DBs)
+            where_clauses.append("(i.sku LIKE %s OR i.name LIKE %s)")
+            like_q = f"%{q}%"
+            params.extend([like_q, like_q])
+
+        if where_clauses:
+            base_sql += " WHERE " + " AND ".join(where_clauses)
+
+        base_sql += """
+            GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+            ORDER BY i.name ASC
+        """
+
+        # Try execute with MySQL-style (%s) then sqlite (?) fallback
+        executed = False
+        try:
+            cur.execute(base_sql, tuple(params))
+            executed = True
+        except Exception:
+            try:
+                sqlite_sql = base_sql.replace('%s', '?')
+                cur.execute(sqlite_sql, tuple(params))
+                executed = True
+            except Exception:
+                # last resort: interpolate LOW_STOCK_THRESHOLD only (safe if int)
+                try:
+                    fallback_sql = base_sql.replace('%s', str(int(LOW_STOCK_THRESHOLD)))
+                    cur.execute(fallback_sql)
+                    executed = True
+                except Exception:
+                    executed = False
+
+        if not executed:
+            raise RuntimeError("Failed to execute items query with available DB driver.")
+
+        raw_rows = cur.fetchall() or []
+        items = []
+        for r in raw_rows:
+            if dict_cursor or hasattr(r, 'keys'):
+                row = {k: r[k] for k in r.keys()}
+            else:
+                cols = [c[0] for c in cur.description] if cur.description else []
+                row = {cols[i]: r[i] for i in range(len(cols))}
+            # normalize
+            row['on_hand'] = int(row.get('on_hand') or 0)
+            rl = row.get('reorder_level')
+            row['reorder_level'] = int(rl) if rl is not None and str(rl).strip() != '' else None
+            items.append(row)
+
+        # compute stats and low alerts
+        stats['active_skus'] = len(items)
+        stats['units_on_hand'] = sum(it.get('on_hand', 0) for it in items)
+        low_alerts = [it for it in items if (it.get('reorder_level') is not None and it.get('on_hand', 0) <= it.get('reorder_level'))]
+
+        # recent movements (10 latest)
+        try:
+            cur.execute("""
+                SELECT when_ts AS `when`, sku, qty, txn_type
+                FROM stock_ledger
+                ORDER BY when_ts DESC
+                LIMIT 10
+            """)
+            mv = cur.fetchall() or []
+            recent_movements = []
+            for r in mv:
+                if dict_cursor or hasattr(r, 'keys'):
+                    recent_movements.append({'when': r.get('when'), 'sku': r.get('sku'), 'qty': r.get('qty'), 'txn_type': r.get('txn_type')})
+                else:
+                    recent_movements.append({'when': r[0], 'sku': r[1], 'qty': r[2], 'txn_type': r[3]})
+            stats['recent_movements'] = len(recent_movements)
+        except Exception:
+            recent_movements = []
+            stats['recent_movements'] = 0
+
+        # categories with counts (preferred: dynamic)
+        try:
+            # MySQL-style
+            try:
+                cur.execute("SELECT category, COUNT(1) AS cnt FROM items WHERE category IS NOT NULL GROUP BY category ORDER BY category ASC")
+            except Exception:
+                # sqlite fallback
+                cur.execute("SELECT category, COUNT(1) AS cnt FROM items WHERE category IS NOT NULL GROUP BY category ORDER BY category ASC")
+            cat_rows = cur.fetchall() or []
+            categories = []
+            for r in cat_rows:
+                if dict_cursor or hasattr(r, 'keys'):
+                    name = r.get('category')
+                    cnt = r.get('cnt') or 0
+                else:
+                    name = r[0] if len(r) > 0 else None
+                    cnt = r[1] if len(r) > 1 else 0
+                if name:
+                    categories.append({'name': name, 'count': int(cnt)})
+            if not categories:
+                # fallback to defaults
+                categories = [{'name': c, 'count': ''} for c in DEFAULT_CATEGORIES]
+        except Exception:
+            categories = [{'name': c, 'count': ''} for c in DEFAULT_CATEGORIES]
+
+    except Exception:
+        app.logger.exception("Failed to load items dashboard")
+        items = []
+        low_alerts = []
+        recent_movements = []
+        categories = [{'name': c, 'count': ''} for c in DEFAULT_CATEGORIES]
+    finally:
+        try:
+            if cur: cur.close()
+        except: pass
+        try:
+            if conn: conn.close()
+        except: pass
+
+    return render_template('items.html',
+                           items=items,
+                           low_alerts=low_alerts,
+                           stats=stats,
+                           recent_movements=recent_movements,
+                           units=DEFAULT_UNITS,
+                           categories=categories,
+                           selected_category=selected_category,
+                           user=session.get('username'))
+
+# -------------------------
+# Export items CSV
+# -------------------------
+@app.route('/export_items')
+def export_items():
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        try:
+            cur = conn.cursor(dictionary=True)
+        except Exception:
+            cur = conn.cursor()
+
+        cur.execute("""
+            SELECT
+              i.sku,
+              i.name,
+              i.unit,
+              i.category,
+              COALESCE(i.reorder_level, %s) AS reorder_level,
+              COALESCE(SUM(sl.qty), 0) AS on_hand
+            FROM items i
+            LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+            GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+            ORDER BY i.name ASC
+        """, (LOW_STOCK_THRESHOLD,))
+        rows = cur.fetchall() or []
+
+        si = io.StringIO()
+        writer = csv.writer(si)
+        writer.writerow(['SKU', 'Name', 'Unit', 'Category', 'On hand', 'Reorder level'])
+        for r in rows:
+            if hasattr(r, 'keys'):
+                sku = r.get('sku'); name = r.get('name'); unit = r.get('unit'); cat = r.get('category')
+                on_hand = r.get('on_hand', 0); rl = r.get('reorder_level')
+            else:
+                cols = [c[0] for c in cur.description]
+                mapping = {cols[i]: r[i] for i in range(len(cols))}
+                sku = mapping.get('sku'); name = mapping.get('name'); unit = mapping.get('unit'); cat = mapping.get('category')
+                on_hand = mapping.get('on_hand', 0); rl = mapping.get('reorder_level')
+            writer.writerow([sku, name, unit, cat, on_hand, rl])
+
+        output = make_response(si.getvalue())
+        output.headers["Content-Disposition"] = "attachment; filename=items.csv"
+        output.headers["Content-type"] = "text/csv"
+        return output
+    except Exception:
+        app.logger.exception("Failed to export items")
+        return redirect(url_for('items'))
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+
+@app.route('/api/items', methods=['POST'])
+def api_create_item():
+    """
+    Robust handler for POST /api/items:
+    - Logs request data inside request context
+    - Accepts JSON (falls back to form)
+    - Validates fields and parses reorder_level safely
+    - Checks duplicate SKU (works with MySQL dict cursor and sqlite3.Row)
+    - Inserts item with MySQL/SQLite placeholder fallbacks
+    """
+    # Debug (only inside request context)
+    app.logger.debug("api_create_item: raw body: %r", request.get_data())
+    app.logger.debug("api_create_item: parsed json: %r", request.get_json(silent=True))
+    app.logger.debug("api_create_item: headers: %r", dict(request.headers))
+
+    # Parse JSON or fallback to form
+    data = request.get_json(silent=True)
+    if data is None:
+        form = request.form.to_dict()
+        if form:
+            data = form
+            app.logger.debug("api_create_item: using form fallback: %r", data)
+        else:
+            return jsonify({'status': 'error', 'message': 'Invalid JSON payload or empty body'}), 400
+
+    # Normalize fields
+    sku = (data.get('sku') or '').strip()
+    name = (data.get('name') or '').strip()
+    unit = (data.get('unit') or '').strip() or 'pcs'
+    category = (data.get('category') or '').strip()
+    try:
+        rl_raw = data.get('reorder_level')
+        reorder_level = None if rl_raw in (None, '') else int(rl_raw)
+    except Exception:
+        return jsonify({'status': 'error', 'message': 'Reorder level must be an integer or omitted'}), 400
+
+    if not sku or not name:
+        return jsonify({'status': 'error', 'message': 'SKU and name are required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        # Try to get a dict-style cursor; fall back to default cursor
+        try:
+            cur = conn.cursor(dictionary=True)
+            dict_cursor = True
+        except Exception:
+            cur = conn.cursor()
+            dict_cursor = False
+
+        # Duplicate check (parameterized; try MySQL style then sqlite style)
+        executed = False
+        try:
+            cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+            executed = True
+        except Exception:
+            try:
+                cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = ?", (sku,))
+                executed = True
+            except Exception:
+                # last resort: use sqlite-style with parameter (safer than string interpolation)
+                cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = ?", (sku,))
+                executed = True
+
+        row = cur.fetchone()
+        cnt = 0
+        if row:
+            # sqlite3.Row supports mapping access by key or index but not .get()
+            try:
+                cnt = row['cnt']            # works for dict cursor and sqlite3.Row
+            except Exception:
+                try:
+                    cnt = row[0]           # fallback to index access
+                except Exception:
+                    cnt = 0
+
+        try:
+            if int(cnt) > 0:
+                return jsonify({'status': 'error', 'message': 'SKU already exists'}), 400
+        except Exception:
+            # defensive: treat non-int as zero
+            cnt = 0
+
+        # Insert item (MySQL then sqlite fallback)
+        insert_sql = """
+            INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """
+        params = (sku, name, unit, category, reorder_level)
+        inserted = False
+        try:
+            cur.execute(insert_sql, params)
+            inserted = True
+        except Exception:
+            try:
+                insert_sql_sqlite = insert_sql.replace('%s', '?').replace('NOW()', "datetime('now')")
+                cur.execute(insert_sql_sqlite, params)
+                inserted = True
+            except Exception as e:
+                app.logger.debug("api_create_item: insert fallback failed: %s", e)
+                inserted = False
+
+        if not inserted:
+            conn.rollback()
+            return jsonify({'status': 'error', 'message': 'Database insert failed'}), 500
+
+        conn.commit()
+
+        item = {
+            'sku': sku,
+            'name': name,
+            'unit': unit,
+            'category': category,
+            'on_hand': 0,
+            'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+        }
+        return jsonify({'status': 'ok', 'item': item}), 200
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        app.logger.exception("Failed to create item (api_create_item): %s", exc)
+        return jsonify({'status': 'error', 'message': 'Server error while creating item. Check server logs.'}), 500
+    finally:
+        try:
+            if cur: cur.close()
+        except Exception:
+            pass
+        try:
+            if conn: conn.close()
+        except Exception:
+            pass
+
+# -------------------------
+# Non-AJAX fallback: create_item (form POST)
+# -------------------------
+@app.route('/create_item', methods=['POST'])
+def create_item():
+    sku = (request.form.get('sku') or '').strip()
+    name = (request.form.get('name') or '').strip()
+    unit = (request.form.get('unit_final') or request.form.get('unit_other') or request.form.get('unit_select') or 'pcs').strip()
+    category = (request.form.get('category_final') or request.form.get('category_other') or request.form.get('category_select') or '').strip()
+    reorder_level = parse_reorder_level(request.form.get('reorder_level'))
+
+    if not sku or not name:
+        flash('SKU and Name are required.', 'danger')
+        return redirect(url_for('items'))
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(1) FROM items WHERE sku = %s", (sku,))
+        if cur.fetchone()[0] > 0:
+            flash('SKU already exists.', 'danger')
+            return redirect(url_for('items'))
+
+        cur.execute("""
+            INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (sku, name, unit, category, reorder_level))
+        conn.commit()
+        flash(f'Item {sku} created.', 'success')
+    except Exception:
+        if conn: conn.rollback()
+        app.logger.exception("Failed to create item (create_item)")
+        flash('Server error while creating item.', 'danger')
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+    return redirect(url_for('items'))
+
+# -------------------------
+# Item detail (unchanged)
+# -------------------------
+@app.route('/item/<sku>')
+def item_detail(sku):
+    conn = None
+    cur = None
+    item = None
+    movements = []
+    try:
+        conn = get_conn()
+        try:
+            cur = conn.cursor(dictionary=True)
+        except Exception:
+            cur = conn.cursor()
+
+        cur.execute("""
+            SELECT sku, name, unit, category, COALESCE(reorder_level, %s) AS reorder_level
+            FROM items WHERE sku = %s
+        """, (LOW_STOCK_THRESHOLD, sku))
+        item = cur.fetchone()
+
+        cur.execute("""
+            SELECT when_ts AS `when`, qty, txn_type, location_id
+            FROM stock_ledger
+            WHERE sku = %s
+            ORDER BY when_ts DESC
+            LIMIT 10
+        """, (sku,))
+        movements = cur.fetchall() or []
+    except Exception:
+        app.logger.exception("Failed to load item detail")
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+    return render_template('item_detail.html', sku=sku, item=item, movements=movements, user=session.get('username'))
+
+
+
+@app.route('/item/<sku>/adjust', methods=['GET','POST'])
+def adjust_stock(sku):
+    if request.method == 'GET':
+        return render_template('adjust_stock.html', sku=sku, user=session.get('username'))
+    # POST: apply adjustment
+    data = request.get_json(silent=True) or {}
+    qty = int(data.get('qty', 0))
+    txn_type = data.get('txn_type', 'adjust')
+    location = data.get('location') or None
+    note = data.get('note') or None
+
+    if qty == 0:
+        return jsonify({'status':'error','message':'Quantity required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO stock_ledger (sku, qty, txn_type, location_id, reference, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (sku, qty, txn_type, location, note))
+        conn.commit()
+        return jsonify({'status':'ok'})
+    except Exception:
+        if conn:
+            conn.rollback()
+        app.logger.exception("Failed to adjust stock")
+        return jsonify({'status':'error','message':'Failed to adjust stock'}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+
+from flask_wtf.csrf import generate_csrf   # add near other imports
+
+@app.route('/receive', methods=['GET'])
+def receive():
+    """
+    Render the receive goods page. Supplies:
+      - items: list of {sku, name, unit}
+      - locations: list of location names/ids
+      - receipt: header dict with id (created if missing)
+      - csrf_token: token for POSTs
+    """
+    conn = None
+    cur = None
+    items = []
+    locations = []
+    receipt = None
+    csrf_token = ''
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # items for select
+        cur.execute("SELECT sku, name, unit FROM items ORDER BY name ASC")
+        rows = cur.fetchall() or []
+        items = [{'sku': r['sku'], 'name': r['name'], 'unit': r['unit']} for r in rows]
+
+        # try locations table, fallback to distinct location_id in stock_ledger
+        try:
+            cur.execute("SELECT name FROM locations ORDER BY name ASC")
+            rows = cur.fetchall() or []
+            locations = [r['name'] for r in rows]
+        except Exception:
+            cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+            rows = cur.fetchall() or []
+            locations = [r['location_id'] for r in rows]
+
+        # ensure a receipt header exists for the page
+        receipt_id = request.args.get('id')
+        if receipt_id:
+            cur.execute("SELECT id, supplier, grn_no FROM receipts WHERE id = ?", (receipt_id,))
+            row = cur.fetchone()
+            if row:
+                receipt = {'id': row['id'], 'supplier': row.get('supplier'), 'grn_no': row.get('grn_no')}
+        if not receipt:
+            cur.execute("INSERT INTO receipts (created_at, supplier) VALUES (datetime('now'), '')")
+            receipt_id = cur.lastrowid
+            receipt = {'id': receipt_id}
+
+        # generate CSRF token for the page (Flask-WTF)
+        csrf_token = generate_csrf()
+
+    except Exception:
+        app.logger.exception("Failed to load receive page data")
+        receipt = receipt or {'id': ''}
+        csrf_token = ''
+    finally:
+        try:
+            if cur: cur.close()
+        except Exception:
+            pass
+        try:
+            if conn: conn.close()
+        except Exception:
+            pass
+
+    return render_template('receive.html',
+                           items=items,
+                           locations=locations,
+                           user=session.get('username'),
+                           receipt=receipt,
+                           csrf_token=csrf_token)
+
+# from datetime import datetime
+# from flask import request, jsonify, render_template, session
+
+# def _exec(cur, query, params=()):
+#     """
+#     Execute a query trying sqlite3-style ? placeholders first,
+#     then retry with %s placeholders for MySQL-style connectors.
+#     Returns the cursor after successful execute.
+#     """
+#     try:
+#         cur.execute(query, params)
+#         return cur
+#     except Exception:
+#         # try converting ? -> %s and retry
+#         try:
+#             q2 = query.replace('?', '%s')
+#             cur.execute(q2, params)
+#             return cur
+#         except Exception:
+#             # re-raise original exception for outer handler to log
+#             raise
+
+# from datetime import datetime
+# from flask import request, jsonify, render_template, session
+
+# # NOTE: Do NOT use `from flask import current_app as app`
+# # Ensure this file is executed after `app = Flask(__name__)` is defined.
+
+# def _exec_sqlite(cur, query, params=()):
+#     """Execute sqlite3 query using ? placeholders; raise on error."""
+#     cur.execute(query, params)
+#     return cur
+
+# @app.route('/receive', methods=['GET'])
+# def receive():
+#     """
+#     Render the receive goods page. Supplies:
+#       - items: list of {sku, name, unit}
+#       - locations: list of location names/ids
+#     """
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+
+#         # items for select
+#         cur.execute("SELECT sku, name, unit FROM items ORDER BY name ASC")
+#         rows = cur.fetchall() or []
+#         items = [{'sku': r['sku'], 'name': r['name'], 'unit': r['unit']} for r in rows]
+
+#         # try locations table, fallback to distinct location_id in stock_ledger
+#         try:
+#             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+#             rows = cur.fetchall() or []
+#             locations = [r['name'] for r in rows]
+#         except Exception:
+#             cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+#             rows = cur.fetchall() or []
+#             locations = [r['location_id'] for r in rows]
+
+#     except Exception:
+#         app.logger.exception("Failed to load receive page data")
+#     finally:
+#         try:
+#             if cur: cur.close()
+#         except Exception:
+#             pass
+#         try:
+#             if conn: conn.close()
+#         except Exception:
+#             pass
+
+#     return render_template('receive.html', items=items, locations=locations, user=session.get('username'))
+
+@app.route('/api/receive', methods=['POST'])
+def api_receive():
+    app.logger.debug("Incoming /api/receive headers: %s", dict(request.headers))
+    app.logger.debug("Incoming /api/receive raw body: %s", request.get_data(as_text=True))
+
+    data = request.get_json(silent=True) or {}
+    grn_no = (data.get('grn_no') or '').strip()
+    supplier = (data.get('supplier') or '').strip()
+    po_ref = (data.get('po_ref') or '').strip()
+    lines = data.get('lines') or []
+
+    # generate GRN if not provided
+    if not grn_no:
+        grn_no = generate_grn_no()
+
+    # basic header validation
+    if not supplier:
+        return jsonify({'status': 'error', 'message': 'Supplier is required'}), 400
+    if not lines or not any(l.get('sku') and float(l.get('qty', 0)) > 0 for l in lines):
+        return jsonify({'status': 'error', 'message': 'At least one valid line is required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # ensure receipt header exists (use provided receipt_id or create new)
+        receipt_id = data.get('receipt_id') or None
+        if receipt_id:
+            cur.execute("SELECT id FROM receipts WHERE id = ?", (receipt_id,))
+            if not cur.fetchone():
+                receipt_id = None
+
+        if not receipt_id:
+            # receipts table in your DB has columns: receipt_no, supplier_id, po_no, received_by, ...
+            # we don't have supplier_id mapping here, so store supplier_email and po_no
+            cur.execute("INSERT INTO receipts (created_at, po_no, supplier_email) VALUES (datetime('now'), ?, ?)",
+                        (po_ref, data.get('supplier_email') or None))
+            receipt_id = cur.lastrowid
+
+        # persist grn_no and order_ref on receipts if missing
+        cur.execute("SELECT grn_no, order_ref FROM receipts WHERE id = ?", (receipt_id,))
+        hdr = cur.fetchone()
+        existing_grn = hdr['grn_no'] if hdr and 'grn_no' in hdr.keys() else None
+        existing_order = hdr['order_ref'] if hdr and 'order_ref' in hdr.keys() else None
+
+        if not existing_grn:
+            cur.execute("UPDATE receipts SET grn_no = ? WHERE id = ?", (grn_no, receipt_id))
+        if not existing_order:
+            try:
+                order_ref = generate_order_ref()
+            except Exception:
+                order_ref = f"ORD-{int(datetime.utcnow().timestamp())}"
+            cur.execute("UPDATE receipts SET order_ref = ? WHERE id = ?", (order_ref, receipt_id))
+        else:
+            order_ref = existing_order
+
+        # collect unique SKUs from payload and validate existence
+        skus = sorted({(l.get('sku') or '').strip() for l in lines if l.get('sku')})
+        sku_exists = {}
+        if skus:
+            placeholders = ','.join('?' for _ in skus)
+            cur.execute(f"SELECT sku FROM items WHERE sku IN ({placeholders})", tuple(skus))
+            found_rows = cur.fetchall() or []
+            found = {r['sku'] for r in found_rows}
+            for s in skus:
+                sku_exists[s] = (s in found)
+
+        # per-line validation
+        errors = {}
+        for idx, ln in enumerate(lines):
+            ln_sku = (ln.get('sku') or '').strip()
+            try:
+                ln_qty = float(ln.get('qty') or 0)
+            except Exception:
+                ln_qty = 0
+            line_errs = []
+            if not ln_sku:
+                line_errs.append('SKU required')
+            elif ln_sku not in sku_exists:
+                line_errs.append('SKU not provided')
+            elif not sku_exists.get(ln_sku, False):
+                line_errs.append('Unknown SKU')
+            if ln_qty <= 0:
+                line_errs.append('Quantity must be greater than zero')
+            if line_errs:
+                errors[idx] = line_errs
+
+        if errors:
+            return jsonify({'status': 'error', 'message': 'Validation errors', 'errors': errors}), 400
+
+        # Insert receipt_lines, ledger rows and update/create items
+        for ln in lines:
+            sku = (ln.get('sku') or '').strip()
+            try:
+                qty = float(ln.get('qty') or 0)
+            except Exception:
+                qty = 0
+            unit = (ln.get('unit') or '').strip() or None
+            batch_id = (ln.get('batch_id') or '').strip() or None
+            location = (ln.get('location') or '').strip() or None
+            expiry = (ln.get('expiry') or '').strip() or None
+            name = (ln.get('name') or '').strip() or sku
+
+            if not sku or qty <= 0:
+                continue
+
+            # insert receipt line if table exists
+            try:
+                cur.execute("""
+                    INSERT INTO receipt_lines (receipt_id, sku, qty, unit, location, batch_id, expiry)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (receipt_id, sku, qty, unit, location, batch_id, expiry))
+            except Exception:
+                # ignore if table missing
+                pass
+
+            # update items.on_hand; if no row updated, insert item
+            cur.execute("UPDATE items SET on_hand = COALESCE(on_hand,0) + ? WHERE sku = ?", (qty, sku))
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO items (sku, name, unit, category, on_hand, reorder_level, created_at) VALUES (?,?,?,?,?,?,datetime('now'))",
+                    (sku, name, unit, '', int(qty), None)
+                )
+
+            # resolve location id if locations table uses names/codes
+            to_location_id = None
+            if location:
+                try:
+                    cur.execute("SELECT id FROM locations WHERE code = ? OR name = ? LIMIT 1", (location, location))
+                    lr = cur.fetchone()
+                    to_location_id = lr['id'] if lr and 'id' in lr.keys() else None
+                except Exception:
+                    to_location_id = None
+
+            # insert ledger row
+            cur.execute("""
+                INSERT INTO stock_ledger (sku, item_sku, qty, txn_type, to_location_id, reference, batch_id, expiry_date, created_by, when_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (sku, sku, qty, 'RECEIVE', to_location_id, grn_no, batch_id, expiry, data.get('confirmed_by','system')))
+
+        # mark receipt confirmed and save supplier email if provided
+        cur.execute("UPDATE receipts SET confirmed = 1, confirmed_at = datetime('now'), supplier_email = COALESCE(supplier_email, ?) WHERE id = ?",
+                    (data.get('supplier_email') or None, receipt_id))
+
+        conn.commit()
+
+        # generate PDF and update receipts.document_path
+        try:
+            # reload lines for PDF if receipt_lines table exists
+            try:
+                cur.execute("SELECT sku, qty, unit, location FROM receipt_lines WHERE receipt_id = ?", (receipt_id,))
+                pdf_rows = cur.fetchall()
+                if pdf_rows:
+                    pdf_lines = [{'sku': r['sku'], 'qty': r['qty'], 'unit': r.get('unit'), 'location': r.get('location')} for r in pdf_rows]
+                else:
+                    pdf_lines = [{'sku': l.get('sku'), 'qty': l.get('qty'), 'unit': l.get('unit'), 'location': l.get('location')} for l in lines]
+            except Exception:
+                pdf_lines = [{'sku': l.get('sku'), 'qty': l.get('qty'), 'unit': l.get('unit'), 'location': l.get('location')} for l in lines]
+
+            supplier_for_email = data.get('supplier_email') or None
+            pdf_path = generate_pdf_for_receipt(grn_no, order_ref, supplier_for_email, pdf_lines)
+            app.logger.info("PDF generated at: %s", pdf_path)
+
+            try:
+                cur.execute("UPDATE receipts SET document_path = ? WHERE id = ?", (pdf_path, receipt_id))
+                conn.commit()
+            except Exception:
+                app.logger.exception("Failed to update receipts.document_path for %s", receipt_id)
+        except Exception:
+            app.logger.exception("PDF generation failed for receipt %s", receipt_id)
+            pdf_path = None
+
+        # send email async if supplier email present and pdf created
+        smtp_cfg = {
+            'host': current_app.config.get('SMTP_HOST', 'smtp.example.com'),
+            'port': int(current_app.config.get('SMTP_PORT', 587)),
+            'username': current_app.config.get('SMTP_USER', 'user@example.com'),
+            'password': current_app.config.get('SMTP_PASS', 'secret'),
+            'use_tls': True
+        }
+        subject = f"Goods Received Confirmation {grn_no}"
+        body = f"Dear Supplier,\n\nWe confirm receipt of goods for GRN {grn_no} (Order {order_ref}). Please find attached the goods received note.\n\nRegards,\nWarehouse Team"
+        if supplier_for_email and pdf_path:
+            try:
+                send_email_async(supplier_for_email, subject, body, pdf_path, smtp_cfg)
+            except Exception:
+                app.logger.exception("Failed to start async email for receipt %s", receipt_id)
+
+        return jsonify({'status': 'ok', 'grn_no': grn_no, 'order_ref': order_ref, 'receipt_id': receipt_id}), 200
+
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        app.logger.exception("Failed to process GRN")
+        return jsonify({'status': 'error', 'message': 'Failed to process GRN'}), 500
+    finally:
+        try:
+            if cur: cur.close()
+        except Exception:
+            pass
+        try:
+            if conn: conn.close()
+        except Exception:
+            pass
+
+# @app.route('/api/receive', methods=['POST'])
+# def api_receive():
+
+#     app.logger.debug("Incoming /api/receive headers: %s", dict(request.headers))
+#     app.logger.debug("Incoming /api/receive raw body: %s", request.get_data(as_text=True))
+#     """
+#     Accepts JSON:
+#       { grn_no, supplier, po_ref, lines: [{ sku, qty, unit, batch_id, location, expiry, name, category, reorder_level }] }
+#     Validates and inserts ledger rows, updates/creates items, and returns { status:'ok', grn_no:'...' }.
+#     """
+#     data = request.get_json(silent=True) or {}
+#     grn_no = (data.get('grn_no') or '').strip()
+#     supplier = (data.get('supplier') or '').strip()
+#     po_ref = (data.get('po_ref') or '').strip()
+#     lines = data.get('lines') or []
+
+#     # generate GRN if not provided
+#     if not grn_no:
+#         grn_no = f"GRN-{datetime.utcnow().strftime('%Y%m%d')}-{int(datetime.utcnow().timestamp())}"
+
+#     # basic header validation
+#     if not supplier:
+#         return jsonify({'status': 'error', 'message': 'Supplier is required'}), 400
+#     if not lines or not any(l.get('sku') and float(l.get('qty', 0)) > 0 for l in lines):
+#         return jsonify({'status': 'error', 'message': 'At least one valid line is required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+
+#         # collect unique SKUs from payload
+#         skus = sorted({(l.get('sku') or '').strip() for l in lines if l.get('sku')})
+#         sku_exists = {}
+#         if skus:
+#             placeholders = ','.join('?' for _ in skus)
+#             cur.execute(f"SELECT sku FROM items WHERE sku IN ({placeholders})", tuple(skus))
+#             found_rows = cur.fetchall() or []
+#             found = {r['sku'] for r in found_rows}
+#             for s in skus:
+#                 sku_exists[s] = (s in found)
+
+#         # per-line validation
+#         errors = {}
+#         for idx, ln in enumerate(lines):
+#             ln_sku = (ln.get('sku') or '').strip()
+#             try:
+#                 ln_qty = float(ln.get('qty') or 0)
+#             except Exception:
+#                 ln_qty = 0
+#             line_errs = []
+#             if not ln_sku:
+#                 line_errs.append('SKU required')
+#             elif ln_sku not in sku_exists:
+#                 line_errs.append('SKU not provided')
+#             elif not sku_exists.get(ln_sku, False):
+#                 line_errs.append('Unknown SKU')
+#             if ln_qty <= 0:
+#                 line_errs.append('Quantity must be greater than zero')
+#             if line_errs:
+#                 errors[idx] = line_errs
+
+#         if errors:
+#             return jsonify({'status': 'error', 'message': 'Validation errors', 'errors': errors}), 400
+
+#         # optional: insert GRN header if table exists (SQLite)
+#         try:
+#             cur.execute("INSERT INTO grn (grn_no, supplier, po_ref, created_at) VALUES (?, ?, ?, datetime('now'))", (grn_no, supplier, po_ref))
+#         except Exception:
+#             # ignore if grn table doesn't exist
+#             pass
+
+#         # Insert ledger rows and update/create items
+#         for ln in lines:
+#             sku = (ln.get('sku') or '').strip()
+#             try:
+#                 qty = float(ln.get('qty') or 0)
+#             except Exception:
+#                 qty = 0
+#             unit = (ln.get('unit') or '').strip() or None
+#             batch_id = (ln.get('batch_id') or '').strip() or None
+#             location = (ln.get('location') or '').strip() or None
+#             expiry = (ln.get('expiry') or '').strip() or None
+#             name = (ln.get('name') or '').strip() or sku
+#             category = (ln.get('category') or '').strip() or ''
+#             reorder_level = ln.get('reorder_level') if ln.get('reorder_level') is not None else None
+
+#             if not sku or qty <= 0:
+#                 continue
+
+#             # update cached on_hand; if no row updated, insert item
+#             cur.execute("UPDATE items SET on_hand = on_hand + ? WHERE sku = ?", (qty, sku))
+#             if cur.rowcount == 0:
+#                 cur.execute(
+#                     "INSERT INTO items (sku, name, unit, category, on_hand, reorder_level, created_at) VALUES (?,?,?,?,?,?,datetime('now'))",
+#                     (sku, name, unit, category, int(qty), reorder_level)
+#                 )
+
+#             # insert ledger row
+#             cur.execute("""
+#                 INSERT INTO stock_ledger
+#                   (sku, qty, txn_type, location_id, reference, batch_id, expiry_date, created_at)
+#                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+#             """, (sku, qty, 'receive', location, grn_no, batch_id, expiry))
+
+#         conn.commit()
+#         return jsonify({'status': 'ok', 'grn_no': grn_no}), 200
+
+#     except Exception:
+#         if conn:
+#             try:
+#                 conn.rollback()
+#             except Exception:
+#                 pass
+#         app.logger.exception("Failed to process GRN")
+#         return jsonify({'status': 'error', 'message': 'Failed to process GRN'}), 500
+#     finally:
+#         try:
+#             if cur: cur.close()
+#         except Exception:
+#             pass
+#         try:
+#             if conn: conn.close()
+#         except Exception:
+#             pass
+
+
+# --- add these imports at top of app.py ---
+# import sqlite3
+# import threading
+# import os
+# from datetime import datetime
+# from flask import current_app, request, jsonify
+# from email.message import EmailMessage
+# import smtplib
+# from reportlab.lib.pagesizes import A4
+# from reportlab.pdfgen import canvas
+# import os
+
+
+
+
+# # --- configuration (adjust if needed) ---
+# DB_PATH = 'busia_wms.sqlite3'   # path to your sqlite DB
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# UPLOAD_DIR = os.path.join(BASE_DIR, 'generated_docs')
+# os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# # --- sequence helpers ---
+# def next_sequence(name):
+#     conn = sqlite3.connect(DB_PATH)
+#     cur = conn.cursor()
+#     cur.execute("BEGIN")
+#     cur.execute("SELECT last FROM sequences WHERE name = ?", (name,))
+#     row = cur.fetchone()
+#     if row is None:
+#         cur.execute("INSERT INTO sequences (name, last) VALUES (?, ?)", (name, 1))
+#         val = 1
+#     else:
+#         val = row[0] + 1
+#         cur.execute("UPDATE sequences SET last = ? WHERE name = ?", (val, name))
+#     conn.commit()
+#     conn.close()
+#     return val
+
+# def generate_grn_no():
+#     seq = next_sequence('grn')
+#     return f"GRN-{datetime.utcnow().strftime('%Y%m%d')}-{seq:04d}"
+
+# def generate_order_ref():
+#     seq = next_sequence('order_ref')
+#     return f"ORD-{datetime.utcnow().strftime('%Y%m%d')}-{seq:04d}"
+
+# # --- PDF generation ---
+# def generate_pdf_for_receipt(grn_no, order_ref, supplier, lines):
+#     filename = f"{grn_no}.pdf"
+#     path = os.path.join(UPLOAD_DIR, filename)
+#     c = canvas.Canvas(path, pagesize=A4)
+#     c.setFont("Helvetica-Bold", 14)
+#     c.drawString(40, 800, f"Goods Received Note {grn_no}")
+#     c.setFont("Helvetica", 10)
+#     c.drawString(40, 780, f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+#     c.drawString(40, 760, f"Order Ref: {order_ref}")
+#     c.drawString(40, 740, f"Supplier: {supplier or ''}")
+#     y = 720
+#     c.setFont("Helvetica-Bold", 10)
+#     c.drawString(40, y, "SKU")
+#     c.drawString(200, y, "Qty")
+#     c.drawString(260, y, "Unit")
+#     c.drawString(320, y, "Location")
+#     c.setFont("Helvetica", 10)
+#     y -= 20
+#     for line in lines:
+#         c.drawString(40, y, str(line.get('sku','')))
+#         c.drawString(200, y, str(line.get('qty','')))
+#         c.drawString(260, y, str(line.get('unit','')))
+#         c.drawString(320, y, str(line.get('location','')))
+#         y -= 18
+#         if y < 60:
+#             c.showPage()
+#             y = 800
+#     c.showPage()
+#     c.save()
+#     return path
+
+# # --- email helpers ---
+# def send_email_with_attachment(to_email, subject, body, attachment_path, smtp_cfg):
+#     msg = EmailMessage()
+#     msg['Subject'] = subject
+#     msg['From'] = smtp_cfg['username']
+#     msg['To'] = to_email
+#     msg.set_content(body)
+#     with open(attachment_path, 'rb') as f:
+#         data = f.read()
+#     msg.add_attachment(data, maintype='application', subtype='pdf', filename=os.path.basename(attachment_path))
+
+#     if smtp_cfg.get('use_tls', True):
+#         server = smtplib.SMTP(smtp_cfg['host'], smtp_cfg['port'])
+#         server.starttls()
+#     else:
+#         server = smtplib.SMTP_SSL(smtp_cfg['host'], smtp_cfg['port'])
+#     server.login(smtp_cfg['username'], smtp_cfg['password'])
+#     server.send_message(msg)
+#     server.quit()
+
+# def send_email_async(to_email, subject, body, attachment_path, smtp_cfg):
+#     t = threading.Thread(target=send_email_with_attachment, args=(to_email, subject, body, attachment_path, smtp_cfg))
+#     t.daemon = True
+#     t.start()
+
+# # --- confirm endpoint (receipts / receipt_lines) ---
+# @app.route('/api/receive/confirm', methods=['POST'])
+# def api_receive_confirm():
+#     payload = request.get_json() or {}
+#     receipt_id = payload.get('receipt_id') or payload.get('grn_id')
+#     if not receipt_id:
+#         return jsonify({'status':'error','message':'Missing receipt_id'}), 400
+
+#     conn = sqlite3.connect(DB_PATH)
+#     cur = conn.cursor()
+#     try:
+#         # load header
+#         cur.execute("SELECT id, grn_no, order_ref, supplier_email, supplier FROM receipts WHERE id = ?", (receipt_id,))
+#         row = cur.fetchone()
+#         if not row:
+#             return jsonify({'status':'error','message':'Receipt not found'}), 404
+#         _, existing_grn_no, existing_order_ref, supplier_email, supplier_name = row
+
+#         # generate numbers if missing
+#         grn_no = existing_grn_no or generate_grn_no()
+#         order_ref = existing_order_ref or generate_order_ref()
+#         if not existing_grn_no:
+#             cur.execute("UPDATE receipts SET grn_no = ? WHERE id = ?", (grn_no, receipt_id))
+#         if not existing_order_ref:
+#             cur.execute("UPDATE receipts SET order_ref = ? WHERE id = ?", (order_ref, receipt_id))
+
+#         # load lines
+#         cur.execute("SELECT sku, qty, unit, location, batch_id, expiry FROM receipt_lines WHERE receipt_id = ?", (receipt_id,))
+#         lines = [{'sku':r[0],'qty':r[1],'unit':r[2],'location':r[3],'batch_id':r[4],'expiry':r[5]} for r in cur.fetchall()]
+
+#         # insert ledger rows and update items.on_hand
+#         for line in lines:
+#             loc_code = line.get('location')
+#             cur.execute("SELECT id FROM locations WHERE code = ? OR name = ? LIMIT 1", (loc_code, loc_code))
+#             loc_row = cur.fetchone()
+#             to_location_id = loc_row[0] if loc_row else None
+
+#             cur.execute("""
+#                 INSERT INTO stock_ledger (sku, item_sku, qty, txn_type, to_location_id, reference, batch_id, expiry_date, created_by, when_ts)
+#                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+#             """, (line['sku'], line['sku'], line['qty'], 'RECEIVE', to_location_id, grn_no, line.get('batch_id'), line.get('expiry'), payload.get('confirmed_by','system')))
+
+#             cur.execute("UPDATE items SET on_hand = COALESCE(on_hand,0) + ? WHERE sku = ?", (line['qty'], line['sku']))
+
+#         # mark confirmed
+#         cur.execute("UPDATE receipts SET confirmed = 1, confirmed_at = datetime('now'), supplier_email = COALESCE(supplier_email, ?) WHERE id = ?", (supplier_email or payload.get('supplier_email'), receipt_id))
+#         conn.commit()
+
+#         # generate PDF and save path
+#         supplier_for_email = supplier_email or payload.get('supplier_email') or supplier_name
+#         pdf_path = generate_pdf_for_receipt(grn_no, order_ref, supplier_for_email, lines)
+#         cur.execute("UPDATE receipts SET document_path = ? WHERE id = ?", (pdf_path, receipt_id))
+#         conn.commit()
+
+#         # send email async if supplier email present
+#         smtp_cfg = {
+#             'host': current_app.config.get('SMTP_HOST', 'smtp.example.com'),
+#             'port': current_app.config.get('SMTP_PORT', 587),
+#             'username': current_app.config.get('SMTP_USER', 'user@example.com'),
+#             'password': current_app.config.get('SMTP_PASS', 'secret'),
+#             'use_tls': True
+#         }
+#         subject = f"Goods Received Confirmation {grn_no}"
+#         body = f"Dear Supplier,\n\nWe confirm receipt of goods for GRN {grn_no} (Order {order_ref}). Please find attached the goods received note.\n\nRegards,\nWarehouse Team"
+#         if supplier_for_email:
+#             send_email_async(supplier_for_email, subject, body, pdf_path, smtp_cfg)
+
+#         return jsonify({'status':'ok','message':'Receipt confirmed','grn_no':grn_no,'order_ref':order_ref}), 200
+
+#     except Exception as e:
+#         conn.rollback()
+#         current_app.logger.exception("Failed to confirm receipt")
+#         return jsonify({'status':'error','message':'Failed to process confirmation','detail':str(e)}), 500
+#     finally:
+#         conn.close()
+import os
+import threading
+import sqlite3
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime
+from flask import current_app
+
+# PDF library
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+# Ensure upload dir is absolute and exists
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, 'generated_docs')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(BASE_DIR, 'busia_wms.sqlite3')  # adjust if your DB path differs
+
+# --- sequence helpers (sqlite) ---
+def next_sequence(name):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    cur.execute("SELECT last FROM sequences WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("INSERT INTO sequences (name, last) VALUES (?, ?)", (name, 1))
+        val = 1
+    else:
+        val = int(row['last']) + 1
+        cur.execute("UPDATE sequences SET last = ? WHERE name = ?", (val, name))
+    conn.commit()
+    conn.close()
+    return val
+
+def generate_grn_no():
+    seq = next_sequence('grn')
+    return f"GRN-{datetime.utcnow().strftime('%Y%m%d')}-{seq:04d}"
+
+def generate_order_ref():
+    seq = next_sequence('order_ref')
+    return f"ORD-{datetime.utcnow().strftime('%Y%m%d')}-{seq:04d}"
+
+# --- PDF generation helper ---
+def generate_pdf_for_receipt(grn_no, order_ref, supplier, lines):
+    filename = f"{grn_no}.pdf"
+    path = os.path.join(UPLOAD_DIR, filename)
+    c = canvas.Canvas(path, pagesize=A4)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, 800, f"Goods Received Note {grn_no}")
+    c.setFont("Helvetica", 10)
+    c.drawString(40, 780, f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    c.drawString(40, 765, f"Order Ref: {order_ref}")
+    c.drawString(40, 750, f"Supplier: {supplier or ''}")
+    y = 730
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, y, "SKU")
+    c.drawString(200, y, "Qty")
+    c.drawString(260, y, "Unit")
+    c.drawString(320, y, "Location")
+    c.setFont("Helvetica", 10)
+    y -= 18
+    for line in lines:
+        c.drawString(40, y, str(line.get('sku','')))
+        c.drawString(200, y, str(line.get('qty','')))
+        c.drawString(260, y, str(line.get('unit','')))
+        c.drawString(320, y, str(line.get('location','')))
+        y -= 16
+        if y < 60:
+            c.showPage()
+            y = 800
+    c.showPage()
+    c.save()
+    return path
+
+# --- email helpers ---
+def send_email_with_attachment(to_email, subject, body, attachment_path, smtp_cfg):
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = smtp_cfg['username']
+    msg['To'] = to_email
+    msg.set_content(body)
+    with open(attachment_path, 'rb') as f:
+        data = f.read()
+    msg.add_attachment(data, maintype='application', subtype='pdf', filename=os.path.basename(attachment_path))
+
+    if smtp_cfg.get('use_tls', True):
+        server = smtplib.SMTP(smtp_cfg['host'], smtp_cfg['port'])
+        server.starttls()
+    else:
+        server = smtplib.SMTP_SSL(smtp_cfg['host'], smtp_cfg['port'])
+    server.login(smtp_cfg['username'], smtp_cfg['password'])
+    server.send_message(msg)
+    server.quit()
+
+def send_email_async(to_email, subject, body, attachment_path, smtp_cfg):
+    t = threading.Thread(target=send_email_with_attachment, args=(to_email, subject, body, attachment_path, smtp_cfg))
+    t.daemon = True
+    t.start()
+
+
+
+# from datetime import datetime
+# from flask import request, jsonify
+
+# @app.route('/receive')
+# def receive():
+#     """
+#     Render the receive goods page. Supplies:
+#       - items: list of {sku, name, unit}
+#       - locations: list of location names/ids
+#     """
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # items for select
+#         cur.execute("SELECT sku, name, unit FROM items ORDER BY name ASC")
+#         items = cur.fetchall() or []
+
+#         # try locations table, fallback to distinct location_id in stock_ledger
+#         try:
+#             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+#             locations = [r['name'] for r in cur.fetchall() or []]
+#         except Exception:
+#             cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+#             locations = [r['location_id'] for r in cur.fetchall() or []]
+
+#     except Exception:
+#         app.logger.exception("Failed to load receive page data")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     return render_template('receive.html', items=items, locations=locations, user=session.get('username'))
+
+# from datetime import datetime
+# from flask import request, jsonify
+
+# @app.route('/api/receive', methods=['POST'])
+# def api_receive():
+#     """
+#     Accepts JSON:
+#       { grn_no, supplier, po_ref, lines: [{ sku, qty, unit, batch_id, location, expiry }] }
+#     Validates SKU existence per-line and returns per-line errors if any.
+#     On success inserts stock_ledger rows and returns { status:'ok', grn_no:'...' }.
+#     """
+#     data = request.get_json(silent=True) or {}
+#     grn_no = (data.get('grn_no') or '').strip()
+#     supplier = (data.get('supplier') or '').strip()
+#     po_ref = (data.get('po_ref') or '').strip()
+#     lines = data.get('lines') or []
+
+#     # generate GRN if not provided
+#     if not grn_no:
+#         grn_no = f"GRN-{datetime.utcnow().strftime('%Y%m%d')}-{int(datetime.utcnow().timestamp())}"
+
+#     # basic header validation
+#     if not supplier:
+#         return jsonify({'status': 'error', 'message': 'Supplier is required'}), 400
+#     if not lines or not any(l.get('sku') and float(l.get('qty', 0)) > 0 for l in lines):
+#         return jsonify({'status': 'error', 'message': 'At least one valid line is required'}), 400
+
+#     # Validate SKUs and other per-line checks
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # collect unique SKUs from payload
+#         skus = sorted({(l.get('sku') or '').strip() for l in lines if l.get('sku')})
+#         sku_exists = {}
+#         if skus:
+#             # query items table for these SKUs
+#             format_strings = ','.join(['%s'] * len(skus))
+#             cur.execute(f"SELECT sku FROM items WHERE sku IN ({format_strings})", tuple(skus))
+#             found = {r['sku'] for r in cur.fetchall() or []}
+#             for s in skus:
+#                 sku_exists[s] = (s in found)
+
+#         # build per-line errors
+#         errors = {}
+#         for idx, ln in enumerate(lines):
+#             ln_sku = (ln.get('sku') or '').strip()
+#             ln_qty = 0
+#             try:
+#                 ln_qty = float(ln.get('qty') or 0)
+#             except Exception:
+#                 ln_qty = 0
+#             line_errs = []
+#             if not ln_sku:
+#                 line_errs.append('SKU required')
+#             elif ln_sku not in sku_exists:
+#                 # SKU not present in payload unique set (empty) -> treat as missing
+#                 line_errs.append('SKU not provided')
+#             elif not sku_exists.get(ln_sku, False):
+#                 line_errs.append('Unknown SKU')
+#             if ln_qty <= 0:
+#                 line_errs.append('Quantity must be greater than zero')
+#             if line_errs:
+#                 errors[idx] = line_errs
+
+#         if errors:
+#             return jsonify({'status': 'error', 'message': 'Validation errors', 'errors': errors}), 400
+
+#         # optional: insert GRN header if table exists
+#         try:
+#             cur.execute("""
+#                 INSERT INTO grn (grn_no, supplier, po_ref, created_at)
+#                 VALUES (%s, %s, %s, NOW())
+#             """, (grn_no, supplier, po_ref))
+#         except Exception:
+#             # ignore if grn table doesn't exist
+#             pass
+
+#         # Insert ledger rows for each line (positive qty)
+#         for ln in lines:
+#             sku = (ln.get('sku') or '').strip()
+#             try:
+#                 qty = float(ln.get('qty') or 0)
+#             except Exception:
+#                 qty = 0
+#             unit = (ln.get('unit') or '').strip() or None
+#             batch_id = (ln.get('batch_id') or '').strip() or None
+#             location = (ln.get('location') or '').strip() or None
+#             expiry = (ln.get('expiry') or '').strip() or None
+
+#             if not sku or qty <= 0:
+#                 continue
+
+#             cur.execute("""
+#                 INSERT INTO stock_ledger
+#                   (sku, qty, txn_type, location_id, reference, batch_id, expiry_date, created_at)
+#                 VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+#             """, (sku, qty, 'receive', location, grn_no, batch_id, expiry))
+
+#         conn.commit()
+#         return jsonify({'status': 'ok', 'grn_no': grn_no})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to process GRN")
+#         return jsonify({'status': 'error', 'message': 'Failed to process GRN'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+from datetime import datetime
+from flask import request, jsonify
+
+@app.route('/issue')
+def issue():
+    """
+    Render the issue page with items and locations for selects.
+    Template expects: items, locations, user
+    """
+    conn = None
+    cur = None
+    items = []
+    locations = []
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT sku, name, unit FROM items ORDER BY name ASC")
+        items = cur.fetchall() or []
+
+        # try locations table first, fallback to distinct location_id
+        try:
+            cur.execute("SELECT name FROM locations ORDER BY name ASC")
+            locations = [r['name'] for r in cur.fetchall() or []]
+        except Exception:
+            cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+            locations = [r['location_id'] for r in cur.fetchall() or []]
+    except Exception:
+        app.logger.exception("Failed to load issue page data")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    return render_template('issue.html', items=items, locations=locations, user=session.get('username'))
+
+
+@app.route('/api/issue', methods=['POST'])
+def api_issue():
+    """
+    Accepts JSON payload:
+      {
+        delivery_no (optional),
+        order_ref (optional),
+        recipient, address, vehicle_reg, driver_name, remarks,
+        lines: [{ sku, qty, unit, location, batch_id, expiry }]
+      }
+
+    Returns:
+      - 200 { status:'ok', delivery_no: 'DN-20260818-1072', order_ref: 'PO-20260818-2500' }
+      - 400 { status:'error', message:'...', errors: { line_index: ['err1','err2'] } }
+      - 500 on server error
+    """
+    data = request.get_json(silent=True) or {}
+    delivery_no = (data.get('delivery_no') or '').strip()
+    order_ref = (data.get('order_ref') or '').strip()
+    recipient = (data.get('recipient') or '').strip()
+    address = (data.get('address') or '').strip()
+    vehicle_reg = (data.get('vehicle_reg') or '').strip()
+    driver_name = (data.get('driver_name') or '').strip()
+    remarks = (data.get('remarks') or '').strip()
+    lines = data.get('lines') or []
+
+    # auto-generate delivery_no and order_ref if missing
+    now = datetime.utcnow()
+    if not delivery_no:
+        delivery_no = f"DN-{now.strftime('%Y%m%d')}-{int(now.timestamp()) % 10000}"
+    if not order_ref:
+        order_ref = f"PO-{now.strftime('%Y%m%d')}-{int(now.timestamp()) % 10000}"
+
+    # header validation
+    if not recipient:
+        return jsonify({'status':'error','message':'Recipient name is required'}), 400
+    if not lines or not any(l.get('sku') and float(l.get('qty', 0)) > 0 for l in lines):
+        return jsonify({'status':'error','message':'At least one valid line is required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+
+        # Validate SKUs in bulk
+        payload_skus = sorted({(l.get('sku') or '').strip() for l in lines if l.get('sku')})
+        sku_exists = {}
+        if payload_skus:
+            placeholders = ','.join(['%s'] * len(payload_skus))
+            cur.execute(f"SELECT sku FROM items WHERE sku IN ({placeholders})", tuple(payload_skus))
+            found = {r['sku'] for r in cur.fetchall() or []}
+            for s in payload_skus:
+                sku_exists[s] = (s in found)
+
+        # per-line validation
+        errors = {}
+        for idx, ln in enumerate(lines):
+            ln_sku = (ln.get('sku') or '').strip()
+            try:
+                ln_qty = float(ln.get('qty') or 0)
+            except Exception:
+                ln_qty = 0
+            line_errs = []
+            if not ln_sku:
+                line_errs.append('SKU required')
+            elif ln_sku not in sku_exists:
+                line_errs.append('SKU not provided in payload')
+            elif not sku_exists.get(ln_sku, False):
+                line_errs.append('Unknown SKU')
+            if ln_qty <= 0:
+                line_errs.append('Quantity must be greater than zero')
+            # optional: validate location exists if you want (skip for now)
+            if line_errs:
+                errors[idx] = line_errs
+
+        if errors:
+            return jsonify({'status':'error','message':'Validation errors', 'errors': errors}), 400
+
+        # Optional: insert delivery header into a delivery table if present
+        try:
+            cur.execute("""
+                INSERT INTO deliveries (delivery_no, order_ref, recipient, address, vehicle_reg, driver_name, remarks, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            """, (delivery_no, order_ref, recipient, address, vehicle_reg, driver_name, remarks))
+        except Exception:
+            # ignore if deliveries table doesn't exist
+            pass
+
+        # Insert ledger rows for each line (negative qty)
+        for ln in lines:
+            sku = (ln.get('sku') or '').strip()
+            try:
+                qty = float(ln.get('qty') or 0)
+            except Exception:
+                qty = 0
+            location = (ln.get('location') or '').strip() or None
+            batch_id = (ln.get('batch_id') or '').strip() or None
+            expiry = (ln.get('expiry') or '').strip() or None
+
+            if not sku or qty <= 0:
+                continue
+
+            cur.execute("""
+                INSERT INTO stock_ledger (sku, qty, txn_type, location_id, reference, batch_id, expiry_date, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            """, (sku, -abs(qty), 'issue', location, delivery_no, batch_id, expiry))
+
+        conn.commit()
+        return jsonify({'status':'ok', 'delivery_no': delivery_no, 'order_ref': order_ref})
+    except Exception:
+        if conn:
+            conn.rollback()
+        app.logger.exception("Failed to create issue")
+        return jsonify({'status':'error','message':'Failed to issue goods'}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+# -------------------------
+# Ledger page (recent)
+# -------------------------
+@app.route('/ledger')
+def ledger():
+    conn = None
+    cur = None
+    rows = []
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT created_at, txn_type AS movement_type, sku, location_id, qty, reference, created_by AS username
+            FROM stock_ledger
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
+        rows = cur.fetchall() or []
+    except Exception:
+        app.logger.exception("Failed to load ledger")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+    return render_template('ledger.html', rows=rows, user=session.get('username'))
+
+
+import csv
+import io
+from flask import make_response
+
+# @app.route('/locations')
+# def locations():
+#     """Render locations page with bin/rack mapping cards."""
+#     conn = None
+#     cur = None
+#     rows = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("""
+#             SELECT id, code, name, type, capacity, description
+#             FROM locations
+#             ORDER BY name ASC
+#         """)
+#         rows = cur.fetchall() or []
+#     except Exception:
+#         app.logger.exception("Failed to load locations")
+#         rows = []
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     return render_template('locations.html', locations=rows, user=session.get('username'))
+
+
+# @app.route('/api/locations', methods=['POST'])
+# def api_create_location():
+#     """
+#     Create a new location.
+#     Expects JSON: { code, name, type, capacity, description }
+#     Returns: { status: 'ok', location: {...} } or { status:'error', message:'...' }
+#     """
+#     data = request.get_json(silent=True) or {}
+#     code = (data.get('code') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     loc_type = (data.get('type') or '').strip()
+#     try:
+#         capacity = int(data.get('capacity') or 0)
+#     except Exception:
+#         capacity = 0
+#     description = (data.get('description') or '').strip()
+
+#     if not code or not name:
+#         return jsonify({'status': 'error', 'message': 'Code and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # prevent duplicate code
+#         cur.execute("SELECT COUNT(1) AS cnt FROM locations WHERE code = %s", (code,))
+#         if cur.fetchone().get('cnt', 0) > 0:
+#             return jsonify({'status': 'error', 'message': 'Location code already exists'}), 400
+
+#         cur.execute("""
+#             INSERT INTO locations (code, name, type, capacity, description, created_at)
+#             VALUES (%s, %s, %s, %s, %s, NOW())
+#         """, (code, name, loc_type, capacity, description))
+#         conn.commit()
+
+#         # return created row (id may not be available without SELECT; do a select)
+#         cur.execute("SELECT id, code, name, type, capacity, description FROM locations WHERE code = %s", (code,))
+#         loc = cur.fetchone() or {
+#             'id': None, 'code': code, 'name': name, 'type': loc_type, 'capacity': capacity, 'description': description
+#         }
+
+#         return jsonify({'status': 'ok', 'location': loc})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to create location")
+#         return jsonify({'status': 'error', 'message': 'Failed to create location'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+# @app.route('/export_locations')
+# def export_locations():
+#     """Export locations as CSV for download."""
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("SELECT code, name, type, capacity, description FROM locations ORDER BY name ASC")
+#         rows = cur.fetchall() or []
+
+#         si = io.StringIO()
+#         writer = csv.writer(si)
+#         writer.writerow(['Code', 'Name', 'Type', 'Capacity', 'Description'])
+#         for r in rows:
+#             writer.writerow([r.get('code',''), r.get('name',''), r.get('type',''), r.get('capacity',0), r.get('description','')])
+
+#         output = make_response(si.getvalue())
+#         output.headers["Content-Disposition"] = "attachment; filename=locations.csv"
+#         output.headers["Content-type"] = "text/csv"
+#         return output
+#     except Exception:
+#         app.logger.exception("Failed to export locations")
+#         return redirect(url_for('locations'))
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+@app.route('/locations')
+def locations():
+    """Render locations page with bin/rack mapping cards."""
+    conn = None
+    cur = None
+    rows = []
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, code, name, type, capacity, description
+            FROM locations
+            ORDER BY name ASC
+        """)
+        rows = cur.fetchall() or []
+    except Exception:
+        app.logger.exception("Failed to load locations")
+        rows = []
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+    return render_template('locations.html', locations=rows, user=session.get('username'))
+
+@app.route('/api/locations', methods=['POST'])
+def api_create_location():
+    """
+    Create a new location.
+    Accepts JSON: { code, name, type, capacity, description }
+    If code is empty, server generates a unique code.
+    """
+    data = request.get_json(silent=True) or {}
+    code = (data.get('code') or '').strip()
+    name = (data.get('name') or '').strip()
+    loc_type = (data.get('type') or '').strip() or 'Storage'
+    try:
+        capacity = int(data.get('capacity') or 0)
+    except Exception:
+        capacity = 0
+    description = (data.get('description') or '').strip()
+
+    if not name:
+        return jsonify({'status': 'error', 'message': 'Name is required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # If code provided, validate uniqueness
+        if code:
+            cur.execute("SELECT COUNT(1) AS cnt FROM locations WHERE code = ?", (code,))
+            row = cur.fetchone()
+            if row and row['cnt'] > 0:
+                return jsonify({'status': 'error', 'message': 'Location code already exists'}), 400
+        else:
+            # Auto-generate code: TYPE_ABBR-YYYYMMDDHHMMSS
+            # Use first 2-4 letters of type (uppercase) as prefix
+            prefix = ''.join([c for c in loc_type.upper() if c.isalnum()])[:4] or 'LOC'
+            ts = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+            code = f"{prefix}-{ts}"
+
+            # Ensure uniqueness (very unlikely collision, but check)
+            cur.execute("SELECT COUNT(1) AS cnt FROM locations WHERE code = ?", (code,))
+            row = cur.fetchone()
+            if row and row['cnt'] > 0:
+                # fallback to include microseconds
+                ts = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
+                code = f"{prefix}-{ts}"
+
+        # Insert row
+        cur.execute("""
+            INSERT INTO locations (code, name, type, capacity, description, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+        """, (code, name, loc_type, capacity, description))
+        conn.commit()
+
+        # Return created row
+        cur.execute("SELECT id, code, name, type, capacity, description FROM locations WHERE code = ?", (code,))
+        loc = cur.fetchone()
+        return jsonify({'status': 'ok', 'location': dict(loc) if loc else {
+            'id': None, 'code': code, 'name': name, 'type': loc_type, 'capacity': capacity, 'description': description
+        }}), 201
+
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        app.logger.exception("Failed to create location")
+        return jsonify({'status': 'error', 'message': 'Failed to create location'}), 500
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+
+
+@app.route('/export_locations')
+def export_locations():
+    """Export locations as CSV for download."""
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT code, name, type, capacity, description FROM locations ORDER BY name ASC")
+        rows = cur.fetchall() or []
+
+        si = io.StringIO()
+        writer = csv.writer(si)
+        writer.writerow(['Code', 'Name', 'Type', 'Capacity', 'Description'])
+        for r in rows:
+            writer.writerow([r['code'], r['name'], r['type'], r['capacity'], r['description']])
+
+        output = make_response(si.getvalue())
+        output.headers["Content-Disposition"] = "attachment; filename=locations.csv"
+        output.headers["Content-type"] = "text/csv"
+        return output
+    except Exception:
+        app.logger.exception("Failed to export locations")
+        return redirect(url_for('locations'))
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+@app.route('/api/locations/<string:code>', methods=['PUT'])
+def api_update_location(code):
+    data = request.get_json(silent=True) or {}
+    new_code = (data.get('code') or '').strip()
+    name = (data.get('name') or '').strip()
+    loc_type = (data.get('type') or '').strip() or 'Storage'
+    try:
+        capacity = int(data.get('capacity') or 0)
+    except Exception:
+        capacity = 0
+    description = (data.get('description') or '').strip()
+
+    if not name:
+        return jsonify({'status': 'error', 'message': 'Name is required'}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # ensure original exists
+        cur.execute("SELECT id FROM locations WHERE code = ?", (code,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({'status': 'error', 'message': 'Location not found'}), 404
+
+        # if new_code provided and different, ensure uniqueness
+        if new_code and new_code != code:
+            cur.execute("SELECT COUNT(1) AS cnt FROM locations WHERE code = ?", (new_code,))
+            r = cur.fetchone()
+            if r and r['cnt'] > 0:
+                return jsonify({'status': 'error', 'message': 'New code already exists'}), 400
+        final_code = new_code or code
+
+        # Try update including description; fallback if column missing
+        try:
+            cur.execute("""
+                UPDATE locations
+                SET code = ?, name = ?, type = ?, capacity = ?, description = ?
+                WHERE code = ?
+            """, (final_code, name, loc_type, capacity, description, code))
+        except sqlite3.OperationalError:
+            # fallback without description
+            cur.execute("""
+                UPDATE locations
+                SET code = ?, name = ?, type = ?, capacity = ?
+                WHERE code = ?
+            """, (final_code, name, loc_type, capacity, code))
+
+        conn.commit()
+        cur.execute("SELECT id, code, name, type, capacity, description FROM locations WHERE code = ?", (final_code,))
+        loc = cur.fetchone()
+        return jsonify({'status': 'ok', 'location': dict(loc) if loc else {'code': final_code, 'name': name, 'type': loc_type, 'capacity': capacity, 'description': description}}), 200
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        app.logger.exception("Failed to update location")
+        return jsonify({'status': 'error', 'message': 'Failed to update location'}), 500
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+
+@app.route('/api/locations/<string:code>', methods=['DELETE'])
+def api_delete_location(code):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM locations WHERE code = ?", (code,))
+        if not cur.fetchone():
+            return jsonify({'status': 'error', 'message': 'Location not found'}), 404
+
+        # Optionally: check for dependent records (stock_ledger, items referencing location) before delete
+        # Example: prevent delete if stock exists at location
+        try:
+            cur.execute("SELECT COUNT(1) AS cnt FROM stock_ledger WHERE location_id = ?", (code,))
+            r = cur.fetchone()
+            if r and r['cnt'] > 0:
+                return jsonify({'status': 'error', 'message': 'Cannot delete location with stock movements. Clear stock first.'}), 400
+        except Exception:
+            # if stock_ledger doesn't exist or query fails, continue with delete
+            pass
+
+        cur.execute("DELETE FROM locations WHERE code = ?", (code,))
+        conn.commit()
+        return jsonify({'status': 'ok'}), 200
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        app.logger.exception("Failed to delete location")
+        return jsonify({'status': 'error', 'message': 'Failed to delete location'}), 500
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=True)
+
+
+
+
+
+
+# # export FLASK_SECRET="replace-with-secret"
+# export SQLITE_PATH="/path/to/busia_wms.sqlite3"
+# export BUSIA_SMTP_HOST="smtp.example.com"
+# export BUSIA_SMTP_PORT="587"
+# export BUSIA_SMTP_USER="smtp-user"    help  add some onmy  code so as it can  GRN no. is automatically generated and the order reference is also automatically generated too and also once the goods received are checked and once confirm receipt and update stock button is clicked a document is automatically generated and a soft copy is sent to the supplier through email to confirm that is received
+# export BUSIA_SMTP_PASS="smtp-pass"
+# export BUSIA_EMAIL_FROM="no-reply@example.com"
+# export BUSIA_EMAIL_FROM_NAME="Busia WMS"
+
+
+# @app.route('/api/locations', methods=['POST'])
+# def api_create_location():
+#     """
+#     Create a new location.
+#     Expects JSON: { code, name, type, capacity, description }
+#     Returns: { status: 'ok', location: {...} } or { status:'error', message:'...' }
+#     """
+#     data = request.get_json(silent=True) or {}
+#     code = (data.get('code') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     loc_type = (data.get('type') or '').strip()
+#     try:
+#         capacity = int(data.get('capacity') or 0)
+#     except Exception:
+#         capacity = 0
+#     description = (data.get('description') or '').strip()
+
+#     if not code or not name:
+#         return jsonify({'status': 'error', 'message': 'Code and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+
+#         # prevent duplicate code
+#         cur.execute("SELECT COUNT(1) AS cnt FROM locations WHERE code = ?", (code,))
+#         row = cur.fetchone()
+#         if row and row['cnt'] > 0:
+#             return jsonify({'status': 'error', 'message': 'Location code already exists'}), 400
+
+#         cur.execute("""
+#             INSERT INTO locations (code, name, type, capacity, description, created_at)
+#             VALUES (?, ?, ?, ?, ?, datetime('now'))
+#         """, (code, name, loc_type, capacity, description))
+#         conn.commit()
+
+#         # return created row
+#         cur.execute("SELECT id, code, name, type, capacity, description FROM locations WHERE code = ?", (code,))
+#         loc = cur.fetchone() or {
+#             'id': None, 'code': code, 'name': name, 'type': loc_type,
+#             'capacity': capacity, 'description': description
+#         }
+
+#         return jsonify({'status': 'ok', 'location': loc})
+#     except Exception:
+#         if conn: conn.rollback()
+#         app.logger.exception("Failed to create location")
+#         return jsonify({'status': 'error', 'message': 'Failed to create location'}), 500
+#     finally:
+#         if cur: cur.close()
+#         if conn: conn.close()
+
+
+
+# @app.route('/')
+# def index():
+#     conn = None
+#     cur = None
+#     items = []
+#     recent_movements = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("""
+#             SELECT
+#               i.sku,
+#               i.name,
+#               i.unit,
+#               i.category,
+#               COALESCE(SUM(sl.qty), 0) AS on_hand,
+#               COALESCE(i.reorder_level, %s) AS reorder_level
+#             FROM items i
+#             LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+#             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+#             ORDER BY i.name ASC
+#         """, (LOW_STOCK_THRESHOLD,))
+#         items = cur.fetchall() or []
+
+#         cur.execute("""
+#             SELECT when_ts AS `when`, sku, qty, txn_type
+#             FROM stock_ledger
+#             ORDER BY when_ts DESC
+#             LIMIT 5
+#         """)
+#         recent_movements = cur.fetchall() or []
+#     except Exception:
+#         app.logger.exception("Failed to load items or movements")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     low_alerts = [it for it in items if int(it.get('on_hand', 0)) <= int(it.get('reorder_level', LOW_STOCK_THRESHOLD))]
+
+#     stats = {
+#         'active_skus': len(items),
+#         'units_on_hand': sum(int(it.get('on_hand', 0)) for it in items),
+#         'recent_movements': len(recent_movements)
+#     }
+
+#     return render_template(
+#         'index.html',
+#         items=items,
+#         user=session.get('username'),
+#         low_alerts=low_alerts,
+#         recent_movements=recent_movements,
+#         stats=stats,
+#         now=datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+#     )
+
+
+
+
+
+# --- add this API endpoint ---
+# @app.route('/api/dashboard', methods=['GET'])
+# def api_dashboard():
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#             dict_cursor = True
+#         except Exception:
+#             cur = conn.cursor()
+#             dict_cursor = False
+
+#         # Active SKUs
+#         cur.execute("SELECT COUNT(DISTINCT sku) AS active_skus FROM items")
+#         row = cur.fetchone()
+#         active_skus = (row['active_skus'] if dict_cursor else row[0]) if row else 0
+
+#         # Units on hand (prefer on_hand column)
+#         try:
+#             cur.execute("SELECT COALESCE(SUM(on_hand),0) AS units_on_hand FROM items")
+#             row = cur.fetchone()
+#             units_on_hand = (row['units_on_hand'] if dict_cursor else row[0]) if row else 0
+#         except Exception:
+#             cur.execute("SELECT COALESCE(SUM(qty),0) AS units_on_hand FROM stock_ledger")
+#             row = cur.fetchone()
+#             units_on_hand = (row['units_on_hand'] if dict_cursor else row[0]) if row else 0
+
+#         # Low stock alerts
+#         cur.execute("SELECT COUNT(1) AS low_stock_alerts FROM items WHERE reorder_level IS NOT NULL AND on_hand <= reorder_level")
+#         row = cur.fetchone()
+#         low_stock_alerts = (row['low_stock_alerts'] if dict_cursor else row[0]) if row else 0
+
+#         # Reorder alerts (limit 10)
+#         cur.execute("""
+#             SELECT sku, name, unit, category, on_hand, reorder_level
+#             FROM items
+#             WHERE reorder_level IS NOT NULL AND on_hand <= reorder_level
+#             ORDER BY (reorder_level - on_hand) DESC
+#             LIMIT 10
+#         """)
+#         rows = cur.fetchall() or []
+#         reorder_alerts = []
+#         for r in rows:
+#             if dict_cursor:
+#                 reorder_alerts.append({
+#                     'sku': r.get('sku'),
+#                     'name': r.get('name'),
+#                     'unit': r.get('unit'),
+#                     'category': r.get('category'),
+#                     'on_hand': r.get('on_hand'),
+#                     'reorder_level': r.get('reorder_level')
+#                 })
+#             else:
+#                 reorder_alerts.append({
+#                     'sku': r[0], 'name': r[1], 'unit': r[2],
+#                     'category': r[3], 'on_hand': r[4], 'reorder_level': r[5]
+#                 })
+
+#         # Recent movements (limit 10) from stock_ledger
+#         cur.execute("""
+#             SELECT when_ts AS ts, sku, qty, txn_type, user
+#             FROM stock_ledger
+#             ORDER BY when_ts DESC
+#             LIMIT 10
+#         """)
+#         rows = cur.fetchall() or []
+#         recent_movements = []
+#         for r in rows:
+#             if dict_cursor:
+#                 recent_movements.append({
+#                     'sku': r.get('sku'),
+#                     'qty': r.get('qty'),
+#                     'type': r.get('txn_type'),
+#                     'user': r.get('user'),
+#                     'ts': str(r.get('ts'))
+#                 })
+#             else:
+#                 recent_movements.append({
+#                     'sku': r[1], 'qty': r[2], 'type': r[3], 'user': r[4], 'ts': str(r[0])
+#                 })
+
+#         payload = {
+#             'active_skus': int(active_skus),
+#             'units_on_hand': int(units_on_hand),
+#             'low_stock_alerts': int(low_stock_alerts),
+#             'reorder_alerts': reorder_alerts,
+#             'recent_movements': recent_movements
+#         }
+#         return jsonify(payload), 200
+
+#     except Exception as exc:
+#         app.logger.exception("api_dashboard failed: %s", exc)
+#         return jsonify({'status': 'error', 'message': 'Server error fetching dashboard'}), 500
+#     finally:
+#         try: 
+#             if cur: cur.close()
+#         except Exception:
+#             pass
+#         try:
+#             if conn: conn.close()
+#         except Exception:
+#             pass
+# Temporary debug version of /api/dashboard — paste in place of your current route.
+# Remove this after debugging.
+
+# -------------------------
+# API: create item (AJAX)
+# -------------------------
+# @app.route('/api/items', methods=['POST'])
+# def api_create_item():
+
+#     app.logger.debug("api_create_item: raw body: %r", request.get_data())
+#     app.logger.debug("api_create_item: parsed json: %r", request.get_json(silent=True))
+#     app.logger.debug("api_create_item: headers: %r", dict(request.headers))
+
+#     data = request.get_json(silent=True)
+#     if not data:
+#         return jsonify({'status':'error','message':'Invalid JSON payload'}), 400
+
+#     sku = (data.get('sku') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     unit = (data.get('unit') or '').strip() or 'pcs'
+#     category = (data.get('category') or '').strip()
+#     reorder_level = parse_reorder_level(data.get('reorder_level'))
+
+#     if not sku or not name:
+#         return jsonify({'status':'error','message':'SKU and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#             dict_cursor = True
+#         except Exception:
+#             cur = conn.cursor()
+#             dict_cursor = False
+
+#         # duplicate check
+#         cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+#         row = cur.fetchone()
+#         cnt = row.get('cnt') if dict_cursor or hasattr(row, 'keys') else (row[0] if row else 0)
+#         if cnt > 0:
+#             return jsonify({'status':'error','message':'SKU already exists'}), 400
+
+#         # insert
+#         cur.execute("""
+#             INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+#             VALUES (%s, %s, %s, %s, %s, NOW())
+#         """, (sku, name, unit, category, reorder_level))
+#         conn.commit()
+
+#         item = {
+#             'sku': sku,
+#             'name': name,
+#             'unit': unit,
+#             'category': category,
+#             'on_hand': 0,
+#             'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+#         }
+#         return jsonify({'status':'ok', 'item': item}), 200
+
+#     except Exception as exc:
+#         if conn: conn.rollback()
+#         app.logger.exception("Failed to create item (api_create_item): %s", exc)
+#         return jsonify({'status':'error','message':'Server error while creating item. Check server logs.'}), 500
+#     finally:
+#         if cur: cur.close()
+#         if conn: conn.close()
+# @app.route('/api/items', methods=['POST'])
+# def api_create_item():
+#     """
+#     Single robust handler for POST /api/items.
+#     - Logs request data inside request context only.
+#     - Accepts JSON; falls back to form-encoded data.
+#     - Validates sku and name, parses reorder_level safely.
+#     - Inserts into DB with MySQL/SQLite placeholder fallbacks.
+#     """
+#     # Debug (only inside request context)
+#     app.logger.debug("api_create_item: raw body: %r", request.get_data())
+#     app.logger.debug("api_create_item: parsed json: %r", request.get_json(silent=True))
+#     app.logger.debug("api_create_item: headers: %r", dict(request.headers))
+
+#     # Try JSON first, then fallback to form data
+#     data = request.get_json(silent=True)
+#     if data is None:
+#         form = request.form.to_dict()
+#         if form:
+#             data = form
+#             app.logger.debug("api_create_item: using form fallback: %r", data)
+#         else:
+#             return jsonify({'status': 'error', 'message': 'Invalid JSON payload or empty body'}), 400
+
+#     # Extract and normalize fields
+#     sku = (data.get('sku') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     unit = (data.get('unit') or '').strip() or 'pcs'
+#     category = (data.get('category') or '').strip()
+#     try:
+#         rl_raw = data.get('reorder_level')
+#         reorder_level = None if rl_raw in (None, '') else int(rl_raw)
+#     except Exception:
+#         return jsonify({'status': 'error', 'message': 'Reorder level must be an integer or omitted'}), 400
+
+#     if not sku or not name:
+#         return jsonify({'status': 'error', 'message': 'SKU and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         # dictionary cursor if available
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#             dict_cursor = True
+#         except Exception:
+#             cur = conn.cursor()
+#             dict_cursor = False
+
+#         # Duplicate check (parameterized; fallback to sqlite style)
+#         executed = False
+#         try:
+#             cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+#             executed = True
+#         except Exception:
+#             try:
+#                 cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = ?", (sku,))
+#                 executed = True
+#             except Exception:
+#                 # last resort (avoid in production)
+#                 cur.execute(f"SELECT COUNT(1) AS cnt FROM items WHERE sku = '{sku}'")
+#                 executed = True
+
+#         row = cur.fetchone()
+#         cnt = 0
+#         if row:
+#             if dict_cursor or hasattr(row, 'keys'):
+#                 cnt = row.get('cnt') or 0
+#             else:
+#                 cnt = row[0] if len(row) > 0 else 0
+
+#         if int(cnt) > 0:
+#             return jsonify({'status': 'error', 'message': 'SKU already exists'}), 400
+
+#         # Insert item (MySQL then sqlite fallback)
+#         insert_sql = """
+#             INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+#             VALUES (%s, %s, %s, %s, %s, NOW())
+#         """
+#         params = (sku, name, unit, category, reorder_level)
+#         inserted = False
+#         try:
+#             cur.execute(insert_sql, params)
+#             inserted = True
+#         except Exception:
+#             try:
+#                 insert_sql_sqlite = insert_sql.replace('%s', '?').replace('NOW()', "datetime('now')")
+#                 cur.execute(insert_sql_sqlite, params)
+#                 inserted = True
+#             except Exception as e:
+#                 app.logger.debug("api_create_item: insert fallback failed: %s", e)
+#                 inserted = False
+
+#         if not inserted:
+#             conn.rollback()
+#             return jsonify({'status': 'error', 'message': 'Database insert failed'}), 500
+
+#         conn.commit()
+
+#         item = {
+#             'sku': sku,
+#             'name': name,
+#             'unit': unit,
+#             'category': category,
+#             'on_hand': 0,
+#             'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+#         }
+#         return jsonify({'status': 'ok', 'item': item}), 200
+
+#     except Exception as exc:
+#         if conn:
+#             try:
+#                 conn.rollback()
+#             except Exception:
+#                 pass
+#         app.logger.exception("Failed to create item (api_create_item): %s", exc)
+#         return jsonify({'status': 'error', 'message': 'Server error while creating item. Check server logs.'}), 500
+#     finally:
+#         try:
+#             if cur: cur.close()
+#         except Exception:
+#             pass
+#         try:
+#             if conn: conn.close()
+#         except Exception:
+#             pass
+
+# Add or replace in app.py (merge with your existing imports)
+# from collections import defaultdict
+
+# @app.route('/items')
+# def items():
+#     """
+#     Items dashboard: returns items, stats, low_alerts, recent_movements, units/categories if needed.
+#     Works with sqlite3 or MySQL connectors (dictionary cursor fallback).
+#     """
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+#     low_alerts = []
+#     stats = {'active_skus': 0, 'units_on_hand': 0, 'recent_movements': 0}
+#     recent_movements = []
+
+#     try:
+#         conn = get_conn()
+#         # dictionary cursor if supported
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#         except Exception:
+#             cur = conn.cursor()
+
+#         # Query items with aggregated on_hand
+#         sql = """
+#             SELECT
+#               i.sku,
+#               i.name,
+#               i.unit,
+#               i.category,
+#               COALESCE(i.reorder_level, %s) AS reorder_level,
+#               COALESCE(SUM(sl.qty), 0) AS on_hand
+#             FROM items i
+#             LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+#             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+#             ORDER BY i.name ASC
+#         """
+#         # Try MySQL-style first (most common in your app)
+#         try:
+#             cur.execute(sql, (LOW_STOCK_THRESHOLD,))
+#         except Exception:
+#             # fallback: try sqlite placeholder style
+#             try:
+#                 cur.execute(sql.replace('%s', '?'), (LOW_STOCK_THRESHOLD,))
+#             except Exception:
+#                 # last resort: interpolate integer (safe if LOW_STOCK_THRESHOLD is int)
+#                 cur.execute(sql.replace('%s', str(int(LOW_STOCK_THRESHOLD))))
+
+#         raw = cur.fetchall() or []
+#         items = []
+#         for r in raw:
+#             if hasattr(r, 'keys'):
+#                 row = {k: r[k] for k in r.keys()}
+#             else:
+#                 cols = [c[0] for c in cur.description] if cur.description else []
+#                 row = {cols[i]: r[i] for i in range(len(cols))}
+#             # normalize types
+#             row['on_hand'] = int(row.get('on_hand') or 0)
+#             rl = row.get('reorder_level')
+#             row['reorder_level'] = int(rl) if rl is not None and str(rl).strip() != '' else None
+#             items.append(row)
+
+#         # Compute stats
+#         stats['active_skus'] = len(items)
+#         stats['units_on_hand'] = sum(it.get('on_hand', 0) for it in items)
+#         # low alerts: on_hand <= reorder_level (only when reorder_level defined and > 0)
+#         low_alerts = [it for it in items if (it.get('reorder_level') is not None and it.get('on_hand', 0) <= it.get('reorder_level'))]
+
+#         # recent movements (10 latest)
+#         try:
+#             cur.execute("""
+#                 SELECT when_ts AS `when`, sku, qty, txn_type
+#                 FROM stock_ledger
+#                 ORDER BY when_ts DESC
+#                 LIMIT 10
+#             """)
+#             mv = cur.fetchall() or []
+#             recent_movements = []
+#             for r in mv:
+#                 if hasattr(r, 'keys'):
+#                     recent_movements.append({'when': r.get('when'), 'sku': r.get('sku'), 'qty': r.get('qty'), 'txn_type': r.get('txn_type')})
+#                 else:
+#                     recent_movements.append({'when': r[0], 'sku': r[1], 'qty': r[2], 'txn_type': r[3]})
+#             stats['recent_movements'] = len(recent_movements)
+#         except Exception:
+#             recent_movements = []
+#             stats['recent_movements'] = 0
+
+#     except Exception:
+#         app.logger.exception("Failed to load items dashboard")
+#         items = []
+#         low_alerts = []
+#         recent_movements = []
+#     finally:
+#         try:
+#             if cur: cur.close()
+#         except: pass
+#         try:
+#             if conn: conn.close()
+#         except: pass
+
+#     return render_template('items.html',
+#                            items=items,
+#                            locations=locations,
+#                            low_alerts=low_alerts,
+#                            stats=stats,
+#                            recent_movements=recent_movements,
+#                            units=DEFAULT_UNITS,
+#                            categories=DEFAULT_CATEGORIES,
+#                            user=session.get('username'))
+
+
+
+# # @app.route('/items')
+# # def items():
+# #     """
+# #     Robust /items route compatible with SQLite and MySQL connectors.
+# #     Normalizes DB rows to a list of dicts for the template.
+# #     """
+# #     conn = None
+# #     cur = None
+# #     items = []
+# #     locations = []
+
+# #     try:
+# #         conn = get_conn()
+
+# #         # Try to create a dictionary cursor if supported (MySQL connector)
+# #         try:
+# #             cur = conn.cursor(dictionary=True)
+# #             dict_cursor_supported = True
+# #         except Exception:
+# #             # Fallback for sqlite3 and other drivers
+# #             cur = conn.cursor()
+# #             dict_cursor_supported = False
+
+# #         # SQL uses a placeholder; we'll attempt SQLite-style first, then MySQL-style
+# #         sql_sqlite = """
+# #             SELECT
+# #               i.sku,
+# #               i.name,
+# #               i.unit,
+# #               i.category,
+# #               COALESCE(i.reorder_level, ?) AS reorder_level,
+# #               COALESCE(SUM(sl.qty), 0) AS on_hand
+# #             FROM items i
+# #             LEFT JOIN stock_ledger sl ON sl.item_sku = i.sku
+# #             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+# #             ORDER BY i.name ASC
+# #         """
+
+# #         executed = False
+# #         # Try SQLite-style parameter
+# #         try:
+# #             cur.execute(sql_sqlite, (LOW_STOCK_THRESHOLD,))
+# #             executed = True
+# #         except Exception:
+# #             # Try MySQL-style (%s)
+# #             try:
+# #                 sql_mysql = sql_sqlite.replace('?', '%s')
+# #                 cur.execute(sql_mysql, (LOW_STOCK_THRESHOLD,))
+# #                 executed = True
+# #             except Exception:
+# #                 # Last resort: interpolate integer directly (safe if LOW_STOCK_THRESHOLD is an int)
+# #                 try:
+# #                     sql_fallback = sql_sqlite.replace('?', str(int(LOW_STOCK_THRESHOLD)))
+# #                     cur.execute(sql_fallback)
+# #                     executed = True
+# #                 except Exception:
+# #                     executed = False
+
+# #         if not executed:
+# #             raise RuntimeError("Failed to execute items query with available DB driver.")
+
+# #         # Fetch rows and normalize to list of dicts
+# #         raw_rows = cur.fetchall() or []
+# #         items = []
+# #         for r in raw_rows:
+# #             # mapping-like row (MySQL dict cursor or sqlite3.Row)
+# #             if hasattr(r, 'keys'):
+# #                 # r behaves like a mapping
+# #                 items.append({k: r[k] for k in r.keys()})
+# #             else:
+# #                 # tuple row: map using cursor.description
+# #                 cols = [c[0] for c in cur.description] if cur.description else []
+# #                 items.append({cols[i]: r[i] for i in range(len(cols))})
+
+# #         # Load locations (try simple query; normalize results)
+# #         try:
+# #             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+# #             loc_rows = cur.fetchall() or []
+# #             locations = []
+# #             for r in loc_rows:
+# #                 if hasattr(r, 'keys'):
+# #                     locations.append(r.get('name'))
+# #                 else:
+# #                     locations.append(r[0] if len(r) > 0 else None)
+# #             locations = [l for l in locations if l]
+# #         except Exception:
+# #             # fallback: distinct location_id from ledger
+# #             try:
+# #                 cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+# #                 loc_rows = cur.fetchall() or []
+# #                 locations = []
+# #                 for r in loc_rows:
+# #                     if hasattr(r, 'keys'):
+# #                         locations.append(r.get('location_id'))
+# #                     else:
+# #                         locations.append(r[0] if len(r) > 0 else None)
+# #                 locations = [l for l in locations if l]
+# #             except Exception:
+# #                 locations = []
+
+# #     except Exception:
+# #         app.logger.exception("Failed to load items or locations")
+# #         items = []
+# #         locations = []
+# #     finally:
+# #         try:
+# #             if cur:
+# #                 cur.close()
+# #         except:
+# #             pass
+# #         try:
+# #             if conn:
+# #                 conn.close()
+# #         except:
+# #             pass
+
+# #     return render_template('items.html', items=items, locations=locations, user=session.get('username'))
+
+
+# # @app.route('/items')
+# # def items():
+# #     conn = None
+# #     cur = None
+# #     items = []
+# #     locations = []
+# #     try:
+# #         conn = get_conn()
+# #         cur = conn.cursor(dictionary=True)
+
+# #         cur.execute("""
+# #             SELECT
+# #               i.sku,
+# #               i.name,
+# #               i.unit,
+# #               i.category,
+# #               COALESCE(i.reorder_level, %s) AS reorder_level,
+# #               COALESCE(SUM(sl.qty), 0) AS on_hand
+# #             FROM items i
+# #             LEFT JOIN stock_ledger sl ON sl.item_sku = i.sku
+# #             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+# #             ORDER BY i.name ASC
+# #         """, (LOW_STOCK_THRESHOLD,))
+# #         items = cur.fetchall() or []
+
+# #         try:
+# #             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+# #             locations = [r['name'] for r in cur.fetchall() or []]
+# #         except Exception:
+# #             try:
+# #                 cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+# #                 locations = [r['location_id'] for r in cur.fetchall() or []]
+# #             except Exception:
+# #                 locations = []
+
+# #     except Exception:
+# #         app.logger.exception("Failed to load items or locations")
+# #         items = []
+# #         locations = []
+# #     finally:
+# #         if cur:
+# #             cur.close()
+# #         if conn:
+# #             conn.close()
+
+# #     return render_template('items.html', items=items, locations=locations, user=session.get('username'))
+
+# # @app.route('/items')
+# # def items():
+# #     """Render items list page with items and available locations."""
+# #     conn = None
+# #     cur = None
+# #     items = []
+# #     locations = []
+# #     try:
+# #         conn = get_conn()
+# #         cur = conn.cursor(dictionary=True)
+
+# #         # Load items with on_hand aggregated from stock_ledger
+# #         cur.execute("""
+# #             SELECT
+# #               i.sku,
+# #               i.name,
+# #               i.unit,
+# #               i.category,
+# #               COALESCE(i.reorder_level, %s) AS reorder_level,
+# #               COALESCE(SUM(sl.qty), 0) AS on_hand
+# #             FROM items i
+# #             LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+# #             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+# #             ORDER BY i.name ASC
+# #         """, (LOW_STOCK_THRESHOLD,))
+# #         items = cur.fetchall() or []
+
+# #         # Try to load locations from a locations table; fallback to distinct locations in stock_ledger
+# #         try:
+# #             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+# #             locations = [r['name'] for r in cur.fetchall() or []]
+# #         except Exception:
+# #             # fallback: distinct location_id from stock_ledger
+# #             try:
+# #                 cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+# #                 locations = [r['location_id'] for r in cur.fetchall() or []]
+# #             except Exception:
+# #                 locations = []
+
+# #     except Exception:
+# #         app.logger.exception("Failed to load items or locations")
+# #         items = []
+# #         locations = []
+# #     finally:
+# #         if cur:
+# #             cur.close()
+# #         if conn:
+# #             conn.close()
+
+# #     return render_template('items.html', items=items, locations=locations, user=session.get('username'))
+
+
+# @app.route('/export_items')
+# def export_items():
+#     """Export items as CSV for download."""
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("""
+#             SELECT
+#               i.sku,
+#               i.name,
+#               i.unit,
+#               i.category,
+#               COALESCE(i.reorder_level, %s) AS reorder_level,
+#               COALESCE(SUM(sl.qty), 0) AS on_hand
+#             FROM items i
+#             LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+#             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+#             ORDER BY i.name ASC
+#         """, (LOW_STOCK_THRESHOLD,))
+#         rows = cur.fetchall() or []
+#         # Build CSV in memory
+#         si = io.StringIO()
+#         writer = csv.writer(si)
+#         writer.writerow(['SKU', 'Name', 'Unit', 'Category', 'On hand', 'Reorder level'])
+#         for r in rows:
+#             writer.writerow([r.get('sku'), r.get('name'), r.get('unit'), r.get('category'),
+#                              r.get('on_hand', 0), r.get('reorder_level')])
+
+#         output = make_response(si.getvalue())
+#         output.headers["Content-Disposition"] = "attachment; filename=items.csv"
+#         output.headers["Content-type"] = "text/csv"
+#         return output
+
+#     except Exception:
+#         app.logger.exception("Failed to export items")
+#         return redirect(url_for('items'))
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+# @app.route('/api/items', methods=['POST'])
+# def api_create_item():
+#     data = request.get_json(silent=True)
+#     if not data:
+#         return jsonify({'status':'error','message':'Invalid JSON payload'}), 400
+
+#     sku = (data.get('sku') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     unit = (data.get('unit') or '').strip() or 'pcs'
+#     category = (data.get('category') or '').strip()
+#     reorder_level_raw = data.get('reorder_level')
+
+#     # validate
+#     if not sku or not name:
+#         return jsonify({'status':'error','message':'SKU and name are required'}), 400
+#     try:
+#         reorder_level = None
+#         if reorder_level_raw is not None and str(reorder_level_raw).strip() != '':
+#             reorder_level = int(reorder_level_raw)
+#     except ValueError:
+#         return jsonify({'status':'error','message':'Reorder level must be an integer'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         # try dictionary cursor, fallback to normal cursor
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#         except Exception:
+#             cur = conn.cursor()
+
+#         # check duplicate SKU
+#         cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+#         row = cur.fetchone()
+#         cnt = row.get('cnt') if isinstance(row, dict) else (row[0] if row else 0)
+#         if cnt > 0:
+#             return jsonify({'status':'error','message':'SKU already exists'}), 400
+
+#         # insert
+#         cur.execute("""
+#             INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+#             VALUES (%s, %s, %s, %s, %s, NOW())
+#         """, (sku, name, unit, category, reorder_level))
+#         conn.commit()
+
+#         item = {
+#             'sku': sku,
+#             'name': name,
+#             'unit': unit,
+#             'category': category,
+#             'on_hand': 0,
+#             'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+#         }
+#         return jsonify({'status':'ok', 'item': item}), 200
+
+#     except Exception as exc:
+#         if conn:
+#             conn.rollback()
+#         # log full exception for debugging
+#         app.logger.exception("Failed to create item (api_create_item): %s", exc)
+#         # return a helpful message to the client (not stack trace)
+#         return jsonify({'status':'error','message':'Server error while creating item. Check server logs for details.'}), 500
+#     finally:
+#         if cur:
+#             try: cur.close()
+#             except: pass
+#         if conn:
+#             try: conn.close()
+#             except: pass
+
+
+# # @app.route('/api/items', methods=['POST'])
+# # def api_create_item():
+# #     data = request.get_json(silent=True)
+# #     if not data:
+# #         return jsonify({'status':'error','message':'Invalid JSON payload'}), 400
+
+# #     sku = (data.get('sku') or '').strip()
+# #     name = (data.get('name') or '').strip()
+# #     unit = (data.get('unit') or '').strip() or 'pcs'
+# #     category = (data.get('category') or '').strip()
+# #     reorder_level = data.get('reorder_level')
+
+# #     if not sku or not name:
+# #         return jsonify({'status':'error','message':'SKU and name are required'}), 400
+
+# #     try:
+# #         if reorder_level is not None and str(reorder_level).strip() != '':
+# #             reorder_level = int(reorder_level)
+# #         else:
+# #             reorder_level = None
+# #     except ValueError:
+# #         return jsonify({'status':'error','message':'Reorder level must be an integer'}), 400
+
+# #     conn = None
+# #     cur = None
+# #     try:
+# #         conn = get_conn()
+# #         cur = conn.cursor(dictionary=True)
+
+# #         cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+# #         if cur.fetchone().get('cnt', 0) > 0:
+# #             return jsonify({'status':'error','message':'SKU already exists'}), 400
+
+# #         cur.execute("""
+# #             INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+# #             VALUES (%s, %s, %s, %s, %s, NOW())
+# #         """, (sku, name, unit, category, reorder_level))
+# #         conn.commit()
+
+# #         item = {
+# #             'sku': sku,
+# #             'name': name,
+# #             'unit': unit,
+# #             'category': category,
+# #             'on_hand': 0,
+# #             'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+# #         }
+# #         return jsonify({'status':'ok', 'item': item}), 200
+
+# #     except Exception:
+# #         if conn:
+# #             conn.rollback()
+# #         app.logger.exception("Failed to create item (api_create_item)")
+# #         return jsonify({'status':'error','message':'Server error while creating item'}), 500
+# #     finally:
+# #         if cur:
+# #             cur.close()
+# #         if conn:
+# #             conn.close()
+
+
+# @app.route('/api/items/check', methods=['GET'])
+# def api_check_item():
+#     """
+#     Query param: sku
+#     Returns JSON: { exists: true/false }
+#     """
+#     sku = (request.args.get('sku') or '').strip()
+#     if not sku:
+#         return jsonify({'exists': False}), 200
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+#         cur.execute("SELECT COUNT(1) FROM items WHERE sku = %s", (sku,))
+#         exists = cur.fetchone()[0] > 0
+#         return jsonify({'exists': exists}), 200
+#     except Exception:
+#         app.logger.exception("Failed to check SKU")
+#         return jsonify({'exists': False}), 200
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+# # -------------------------
+# # Item detail and adjust
+# # -------------------------
+# @app.route('/item/<sku>')
+# def item_detail(sku):
+#     conn = None
+#     cur = None
+#     item = None
+#     movements = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("""
+#             SELECT sku, name, unit, category, COALESCE(reorder_level, %s) AS reorder_level
+#             FROM items WHERE sku = %s
+#         """, (LOW_STOCK_THRESHOLD, sku))
+#         item = cur.fetchone()
+
+#         cur.execute("""
+#             SELECT when_ts AS `when`, qty, txn_type, location_id
+#             FROM stock_ledger
+#             WHERE sku = %s
+#             ORDER BY when_ts DESC
+#             LIMIT 10
+#         """, (sku,))
+#         movements = cur.fetchall() or []
+#     except Exception:
+#         app.logger.exception("Failed to load item detail")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     return render_template('item_detail.html', sku=sku, item=item, movements=movements, user=session.get('username'))
+
+
+
+
+
+# # Temporary debug route — add to app.py, restart Flask, then open /debug_db
+# @app.route('/debug_db')
+# def debug_db():
+#     import json
+#     conn = None
+#     cur = None
+#     out = {'db_path': None, 'items_count': None, 'sample_items': [], 'ledger_totals_sample': []}
+#     try:
+#         # show which DB path the app is using
+#         out['db_path'] = DB_PATH if 'DB_PATH' in globals() else os.getenv('SQLITE_PATH', None)
+
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # items count
+#         cur.execute("SELECT COUNT(*) AS cnt FROM items")
+#         out['items_count'] = cur.fetchone().get('cnt', 0)
+
+#         # sample items (first 20)
+#         cur.execute("SELECT sku, name, COALESCE(is_seeded,0) AS is_seeded, unit, category, reorder_level FROM items ORDER BY sku LIMIT 20")
+#         out['sample_items'] = cur.fetchall() or []
+
+#         # ledger totals grouped by item_sku and sku (show top 20)
+#         cur.execute("""
+#             SELECT COALESCE(item_sku, sku) AS key_sku, SUM(qty) AS on_hand
+#             FROM stock_ledger
+#             GROUP BY COALESCE(item_sku, sku)
+#             ORDER BY on_hand DESC
+#             LIMIT 20
+#         """)
+#         out['ledger_totals_sample'] = cur.fetchall() or []
+
+#     except Exception as e:
+#         out['error'] = str(e)
+#     finally:
+#         try:
+#             if cur: cur.close()
+#             if conn: conn.close()
+#         except:
+#             pass
+#     return app.response_class(response=json.dumps(out, default=str, indent=2), mimetype='application/json')
+
+
+
+
+# @app.route('/api/dashboard', methods=['GET'])
+# def api_dashboard_debug():
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#             dict_cursor = True
+#         except Exception:
+#             cur = conn.cursor()
+#             dict_cursor = False
+
+#         # Active SKUs
+#         cur.execute("SELECT COUNT(DISTINCT sku) AS active_skus FROM items")
+#         row = cur.fetchone()
+#         active_skus = (row['active_skus'] if dict_cursor else row[0]) if row else 0
+
+#         # Units on hand
+#         cur.execute("SELECT COALESCE(SUM(on_hand),0) AS units_on_hand FROM items")
+#         row = cur.fetchone()
+#         units_on_hand = (row['units_on_hand'] if dict_cursor else row[0]) if row else 0
+
+#         # Low stock alerts
+#         cur.execute("SELECT COUNT(1) AS low_stock_alerts FROM items WHERE reorder_level IS NOT NULL AND on_hand <= reorder_level")
+#         row = cur.fetchone()
+#         low_stock_alerts = (row['low_stock_alerts'] if dict_cursor else row[0]) if row else 0
+
+#         # Reorder alerts (limit 10)
+#         cur.execute("""
+#             SELECT sku, name, unit, category, on_hand, reorder_level
+#             FROM items
+#             WHERE reorder_level IS NOT NULL AND on_hand <= reorder_level
+#             ORDER BY (reorder_level - on_hand) DESC
+#             LIMIT 10
+#         """)
+#         rows = cur.fetchall() or []
+#         reorder_alerts = []
+#         for r in rows:
+#             if dict_cursor:
+#                 reorder_alerts.append({
+#                     'sku': r.get('sku'),
+#                     'name': r.get('name'),
+#                     'unit': r.get('unit'),
+#                     'category': r.get('category'),
+#                     'on_hand': r.get('on_hand'),
+#                     'reorder_level': r.get('reorder_level')
+#                 })
+#             else:
+#                 reorder_alerts.append({
+#                     'sku': r[0], 'name': r[1], 'unit': r[2],
+#                     'category': r[3], 'on_hand': r[4], 'reorder_level': r[5]
+#                 })
+
+#         # Recent movements
+#         cur.execute("""
+#             SELECT when_ts AS ts, sku, qty, txn_type, user
+#             FROM stock_ledger
+#             ORDER BY when_ts DESC
+#             LIMIT 10
+#         """)
+#         rows = cur.fetchall() or []
+#         recent_movements = []
+#         for r in rows:
+#             if dict_cursor:
+#                 recent_movements.append({
+#                     'sku': r.get('sku'),
+#                     'qty': r.get('qty'),
+#                     'type': r.get('txn_type'),
+#                     'user': r.get('user'),
+#                     'ts': str(r.get('ts'))
+#                 })
+#             else:
+#                 recent_movements.append({
+#                     'sku': r[1], 'qty': r[2], 'type': r[3], 'user': r[4], 'ts': str(r[0])
+#                 })
+
+#         payload = {
+#             'active_skus': int(active_skus),
+#             'units_on_hand': int(units_on_hand),
+#             'low_stock_alerts': int(low_stock_alerts),
+#             'reorder_alerts': reorder_alerts,
+#             'recent_movements': recent_movements
+#         }
+#         return jsonify(payload), 200
+
+#     except Exception as exc:
+#         tb = traceback.format_exc()
+#         app.logger.error("api_dashboard_debug exception: %s", tb)
+#         # Return traceback in JSON for debugging (remove in production)
+#         return jsonify({'status': 'error', 'message': 'Server error fetching dashboard', 'traceback': tb}), 500
+#     finally:
+#         try:
+#             if cur: cur.close()
+#         except Exception:
+#             pass
+#         try:
+#             if conn: conn.close()
+#         except Exception:
+#             pass
+
+
+# # --- replace your existing index() with this improved version ---
+# @app.route('/')
+# def index():
+#     conn = None
+#     cur = None
+#     items = []
+#     recent_movements = []
+#     try:
+#         conn = get_conn()
+#         try:
+#             cur = conn.cursor(dictionary=True)
+#             dict_cursor = True
+#         except Exception:
+#             cur = conn.cursor()
+#             dict_cursor = False
+
+#         # Items: prefer stored on_hand, fallback to ledger sum
+#         cur.execute("""
+#             SELECT
+#               i.sku,
+#               i.name,
+#               i.unit,
+#               i.category,
+#               COALESCE(i.on_hand, COALESCE(SUM(sl.qty), 0)) AS on_hand,
+#               COALESCE(i.reorder_level, %s) AS reorder_level
+#             FROM items i
+#             LEFT JOIN stock_ledger sl ON sl.sku = i.sku
+#             GROUP BY i.sku, i.name, i.unit, i.category, i.on_hand, i.reorder_level
+#             ORDER BY i.name ASC
+#         """, (LOW_STOCK_THRESHOLD,))
+#         items = cur.fetchall() or []
+
+#         # Recent movements for initial render
+#         cur.execute("""
+#             SELECT when_ts AS `when`, sku, qty, txn_type
+#             FROM stock_ledger
+#             ORDER BY when_ts DESC
+#             LIMIT 5
+#         """)
+#         recent_movements = cur.fetchall() or []
+#     except Exception:
+#         app.logger.exception("Failed to load items or movements")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     low_alerts = [it for it in items if int(it.get('on_hand', 0)) <= int(it.get('reorder_level', LOW_STOCK_THRESHOLD))]
+
+#     stats = {
+#         'active_skus': len(items),
+#         'units_on_hand': sum(int(it.get('on_hand', 0)) for it in items),
+#         'recent_movements': len(recent_movements)
+#     }
+
+#     return render_template(
+#         'index.html',
+#         items=items,
+#         user=session.get('username'),
+#         low_alerts=low_alerts,
+#         recent_movements=recent_movements,
+#         stats=stats,
+#         now=datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+#     )
+
+# from flask import render_template, session, current_app as app, jsonify
+# from decimal import Decimal
+
+# LOW_STOCK_THRESHOLD = 5  # adjust as needed
+
+# @app.route('/items')
+# def items():
+#     """Render items list page with items and available locations."""
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # Aggregate on_hand from stock_ledger. Support both sl.sku and sl.item_sku column names.
+#         # Use COALESCE to fall back to LOW_STOCK_THRESHOLD when reorder_level is NULL.
+#         cur.execute("""
+#             SELECT
+#               i.sku,
+#               i.name,
+#               i.unit,
+#               i.category,
+#               COALESCE(i.reorder_level, %s) AS reorder_level,
+#               COALESCE(SUM(COALESCE(sl.qty, 0)), 0) AS on_hand
+#             FROM items i
+#             LEFT JOIN stock_ledger sl
+#               ON ( (sl.sku IS NOT NULL AND sl.sku = i.sku)
+#                    OR (sl.item_sku IS NOT NULL AND sl.item_sku = i.sku) )
+#             GROUP BY i.sku, i.name, i.unit, i.category, i.reorder_level
+#             ORDER BY i.name ASC
+#         """, (LOW_STOCK_THRESHOLD,))
+#         items = cur.fetchall() or []
+
+#         # Normalize on_hand to int (some drivers return Decimal)
+#         for r in items:
+#             val = r.get('on_hand', 0)
+#             if isinstance(val, Decimal):
+#                 r['on_hand'] = int(val)
+#             else:
+#                 try:
+#                     r['on_hand'] = int(val or 0)
+#                 except Exception:
+#                     r['on_hand'] = 0
+
+#         # Try to load locations from locations table (preferred)
+#         try:
+#             cur.execute("SELECT id, COALESCE(name, code) AS name FROM locations ORDER BY name ASC")
+#             loc_rows = cur.fetchall() or []
+#             # return list of names (or dicts if you prefer)
+#             locations = [r['name'] for r in loc_rows]
+#         except Exception:
+#             # fallback 1: distinct location_id/from_location_id/to_location_id from stock_ledger
+#             try:
+#                 cur.execute("""
+#                     SELECT DISTINCT COALESCE(location_id, from_location_id, to_location_id) AS loc
+#                     FROM stock_ledger
+#                     WHERE COALESCE(location_id, from_location_id, to_location_id) IS NOT NULL
+#                     ORDER BY loc
+#                 """)
+#                 locations = [r['loc'] for r in cur.fetchall() or []]
+#             except Exception:
+#                 # final fallback: empty list
+#                 locations = []
+
+#     except Exception:
+#         app.logger.exception("Failed to load items or locations")
+#         items = []
+#         locations = []
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+#     return render_template('items.html', items=items, locations=locations, user=session.get('username'))
+
+
+
+
+
+# @app.route('/api/items', methods=['POST'])
+# def api_create_item():
+#     """
+#     Create a new item. Returns JSON:
+#       { status: 'ok', item: { sku, name, unit, category, on_hand, reorder_level } }
+#     or { status: 'error', message: '...' }
+#     """
+#     data = request.get_json(silent=True) or {}
+#     sku = (data.get('sku') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     unit = (data.get('unit') or '').strip() or 'pcs'
+#     category = (data.get('category') or '').strip()
+#     reorder_level = data.get('reorder_level')
+#     try:
+#         reorder_level = int(reorder_level) if reorder_level is not None and str(reorder_level).strip() != '' else None
+#     except Exception:
+#         reorder_level = None
+
+#     if not sku or not name:
+#         return jsonify({'status': 'error', 'message': 'SKU and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+
+#         # check duplicate
+#         cur.execute("SELECT COUNT(1) AS cnt FROM items WHERE sku = %s", (sku,))
+#         if cur.fetchone().get('cnt', 0) > 0:
+#             return jsonify({'status': 'error', 'message': 'SKU already exists'}), 400
+
+#         # insert
+#         cur.execute("""
+#             INSERT INTO items (sku, name, unit, category, reorder_level, created_at)
+#             VALUES (%s, %s, %s, %s, %s, NOW())
+#         """, (sku, name, unit, category, reorder_level))
+#         conn.commit()
+
+#         # return created item (on_hand default 0)
+#         item = {
+#             'sku': sku,
+#             'name': name,
+#             'unit': unit,
+#             'category': category,
+#             'on_hand': 0,
+#             'reorder_level': reorder_level if reorder_level is not None else LOW_STOCK_THRESHOLD
+#         }
+#         return jsonify({'status': 'ok', 'item': item})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to create item")
+#         return jsonify({'status': 'error', 'message': 'Failed to create item'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+# @app.route('/api/items', methods=['POST'])
+# def api_create_item():
+#     """
+#     Simple API endpoint to create a new item.
+#     Expects JSON: { sku, name, unit, category }
+#     Returns JSON { status: 'ok' } or { status: 'error', message: '...' }
+#     """
+#     data = request.get_json(silent=True) or {}
+#     sku = (data.get('sku') or '').strip()
+#     name = (data.get('name') or '').strip()
+#     unit = (data.get('unit') or '').strip() or 'pcs'
+#     category = (data.get('category') or '').strip()
+
+#     if not sku or not name:
+#         return jsonify({'status': 'error', 'message': 'SKU and name are required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+#         # Insert item if not exists
+#         cur.execute("SELECT COUNT(1) FROM items WHERE sku = %s", (sku,))
+#         if cur.fetchone()[0] > 0:
+#             return jsonify({'status': 'error', 'message': 'SKU already exists'}), 400
+
+#         cur.execute("""
+#             INSERT INTO items (sku, name, unit, category, created_at)
+#             VALUES (%s, %s, %s, %s, NOW())
+#         """, (sku, name, unit, category))
+#         conn.commit()
+#         return jsonify({'status': 'ok'})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to create item")
+#         return jsonify({'status': 'error', 'message': 'Failed to create item'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+
+# -------------------------
+# Receive / Issue pages + API
+# -------------------------
+# @app.route('/receive')
+# def receive():
+#     # simple page that can be extended; uses items and locations for selects
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("SELECT sku, name FROM items ORDER BY name ASC")
+#         items = cur.fetchall() or []
+#         try:
+#             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+#             locations = [r['name'] for r in cur.fetchall() or []]
+#         except Exception:
+#             cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+#             locations = [r['location_id'] for r in cur.fetchall() or []]
+#     except Exception:
+#         app.logger.exception("Failed to load receive page data")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+#     return render_template('receive.html', items=items, locations=locations, user=session.get('username'))
+
+
+
+
+# @app.route('/api/receive', methods=['POST'])
+# def api_receive():
+#     """
+#     Accepts JSON:
+#       { grn_no, supplier, po_ref, lines: [{ sku, qty, unit, batch_id, location, expiry }] }
+#     Creates stock_ledger rows (positive qty) and returns { status:'ok', grn_no: '...' }.
+#     """
+#     data = request.get_json(silent=True) or {}
+#     grn_no = (data.get('grn_no') or '').strip()
+#     supplier = (data.get('supplier') or '').strip()
+#     po_ref = (data.get('po_ref') or '').strip()
+#     lines = data.get('lines') or []
+
+#     # generate GRN if not provided
+#     if not grn_no:
+#         grn_no = f"GRN-{datetime.utcnow().strftime('%Y%m%d')}-{int(datetime.utcnow().timestamp())}"
+
+#     if not supplier:
+#         return jsonify({'status': 'error', 'message': 'Supplier is required'}), 400
+#     if not lines or not any(l.get('sku') and float(l.get('qty', 0)) > 0 for l in lines):
+#         return jsonify({'status': 'error', 'message': 'At least one valid line is required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+
+#         # Insert a GRN header record if you have a grn table (optional)
+#         try:
+#             cur.execute("""
+#                 INSERT INTO grn (grn_no, supplier, po_ref, created_at)
+#                 VALUES (%s, %s, %s, NOW())
+#             """, (grn_no, supplier, po_ref))
+#         except Exception:
+#             # ignore if grn table doesn't exist
+#             pass
+
+#         # Insert ledger rows for each line (positive qty)
+#         for ln in lines:
+#             sku = (ln.get('sku') or '').strip()
+#             try:
+#                 qty = float(ln.get('qty') or 0)
+#             except Exception:
+#                 qty = 0
+#             unit = (ln.get('unit') or '').strip() or None
+#             batch_id = (ln.get('batch_id') or '').strip() or None
+#             location = (ln.get('location') or '').strip() or None
+#             expiry = (ln.get('expiry') or '').strip() or None
+
+#             if not sku or qty <= 0:
+#                 continue
+
+#             # Insert into stock_ledger: positive qty for receive
+#             cur.execute("""
+#                 INSERT INTO stock_ledger
+#                   (sku, qty, txn_type, location_id, reference, batch_id, expiry_date, created_at)
+#                 VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+#             """, (sku, qty, 'receive', location, grn_no, batch_id, expiry))
+
+#         conn.commit()
+#         return jsonify({'status': 'ok', 'grn_no': grn_no})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to process GRN")
+#         return jsonify({'status': 'error', 'message': 'Failed to process GRN'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+# @app.route('/issue')
+# def issue():
+#     # page with items and locations for the issue form
+#     conn = None
+#     cur = None
+#     items = []
+#     locations = []
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor(dictionary=True)
+#         cur.execute("SELECT sku, name FROM items ORDER BY name ASC")
+#         items = cur.fetchall() or []
+#         try:
+#             cur.execute("SELECT name FROM locations ORDER BY name ASC")
+#             locations = [r['name'] for r in cur.fetchall() or []]
+#         except Exception:
+#             cur.execute("SELECT DISTINCT location_id FROM stock_ledger WHERE location_id IS NOT NULL")
+#             locations = [r['location_id'] for r in cur.fetchall() or []]
+#     except Exception:
+#         app.logger.exception("Failed to load issue page data")
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+#     return render_template('issue.html', items=items, locations=locations, user=session.get('username'))
+
+
+# @app.route('/api/issue', methods=['POST'])
+# def api_issue():
+#     """
+#     Accepts JSON payload:
+#     { delivery_no, customer, lines: [{sku, qty, location}] }
+#     Creates ledger entries and returns {status:'ok', delivery_no: '...'}
+#     """
+#     data = request.get_json(silent=True) or {}
+#     delivery_no = data.get('delivery_no') or f"DN-{int(datetime.utcnow().timestamp())}"
+#     customer = data.get('customer') or ''
+#     lines = data.get('lines') or []
+
+#     if not customer or not lines:
+#         return jsonify({'status':'error','message':'Customer and lines required'}), 400
+
+#     conn = None
+#     cur = None
+#     try:
+#         conn = get_conn()
+#         cur = conn.cursor()
+#         # Insert ledger rows for each line (negative qty for issue)
+#         for ln in lines:
+#             sku = ln.get('sku')
+#             qty = int(ln.get('qty') or 0)
+#             loc = ln.get('location') or None
+#             if not sku or qty <= 0:
+#                 continue
+#             cur.execute("""
+#                 INSERT INTO stock_ledger (sku, qty, txn_type, location_id, reference, created_at)
+#                 VALUES (%s, %s, %s, %s, %s, NOW())
+#             """, (sku, -abs(qty), 'issue', loc, delivery_no))
+#         conn.commit()
+#         return jsonify({'status':'ok', 'delivery_no': delivery_no})
+#     except Exception:
+#         if conn:
+#             conn.rollback()
+#         app.logger.exception("Failed to create issue")
+#         return jsonify({'status':'error','message':'Failed to issue goods'}), 500
+#     finally:
+#         if cur:
+#             cur.close()
+#         if conn:
+#             conn.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# USE busia_wms;
+
+# CREATE TABLE IF NOT EXISTS items (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   sku VARCHAR(128) NOT NULL UNIQUE,
+#   name VARCHAR(255) NOT NULL,
+#   unit VARCHAR(64) DEFAULT 'pcs',
+#   category VARCHAR(128),
+#   reorder_level INT DEFAULT 0,
+#   price DECIMAL(10,2) DEFAULT NULL,
+#   carton_price DECIMAL(10,2) DEFAULT NULL,
+#   description TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS locations (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   code VARCHAR(64) UNIQUE,
+#   name VARCHAR(128) NOT NULL,
+#   type VARCHAR(64),
+#   capacity INT DEFAULT NULL,
+#   notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS suppliers (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   code VARCHAR(64) UNIQUE,
+#   name VARCHAR(255) NOT NULL,
+#   contact_name VARCHAR(255),
+#   phone VARCHAR(64),
+#   email VARCHAR(255),
+#   address TEXT,
+#   notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS customers (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   code VARCHAR(64) UNIQUE,
+#   name VARCHAR(255) NOT NULL,
+#   contact_name VARCHAR(255),
+#   phone VARCHAR(64),
+#   email VARCHAR(255),
+#   address TEXT,
+#   notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS users (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   username VARCHAR(128) NOT NULL UNIQUE,
+#   full_name VARCHAR(255),
+#   email VARCHAR(255),
+#   password_hash VARCHAR(255),
+#   role VARCHAR(64) DEFAULT 'user',
+#   is_active TINYINT(1) DEFAULT 1,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS batches (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   batch_no VARCHAR(128) NOT NULL,
+#   item_sku VARCHAR(128) NOT NULL,
+#   manufacture_date DATE DEFAULT NULL,
+#   expiry_date DATE DEFAULT NULL,
+#   qty INT DEFAULT 0,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+#   UNIQUE KEY ux_batch_item (batch_no, item_sku),
+#   CONSTRAINT fk_batches_item FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE CASCADE ON UPDATE CASCADE
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS receipts (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   receipt_no VARCHAR(128) NOT NULL UNIQUE,
+#   supplier_id INT DEFAULT NULL,
+#   po_no VARCHAR(128) DEFAULT NULL,
+#   received_by VARCHAR(128) DEFAULT NULL,
+#   received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   CONSTRAINT fk_receipts_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS receipt_lines (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   receipt_id INT NOT NULL,
+#   item_sku VARCHAR(128) NOT NULL,
+#   qty INT NOT NULL,
+#   unit VARCHAR(64) DEFAULT 'pcs',
+#   location_id INT DEFAULT NULL,
+#   batch_no VARCHAR(128) DEFAULT NULL,
+#   line_notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   CONSTRAINT fk_receipt_lines_receipt FOREIGN KEY (receipt_id) REFERENCES receipts(id) ON DELETE CASCADE,
+#   CONSTRAINT fk_receipt_lines_item FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT,
+#   CONSTRAINT fk_receipt_lines_loc FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS deliveries (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   delivery_no VARCHAR(128) NOT NULL UNIQUE,
+#   order_ref VARCHAR(128) DEFAULT NULL,
+#   recipient VARCHAR(255) DEFAULT NULL,
+#   address TEXT,
+#   vehicle_reg VARCHAR(64),
+#   driver_name VARCHAR(128),
+#   remarks TEXT,
+#   created_by VARCHAR(128) DEFAULT NULL,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS delivery_lines (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   delivery_id INT NOT NULL,
+#   item_sku VARCHAR(128) NOT NULL,
+#   qty INT NOT NULL,
+#   unit VARCHAR(64) DEFAULT 'pcs',
+#   location_id INT DEFAULT NULL,
+#   batch_no VARCHAR(128) DEFAULT NULL,
+#   line_notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   CONSTRAINT fk_delivery_lines_delivery FOREIGN KEY (delivery_id) REFERENCES deliveries(id) ON DELETE CASCADE,
+#   CONSTRAINT fk_delivery_lines_item FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT,
+#   CONSTRAINT fk_delivery_lines_loc FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS stock_ledger (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   sku VARCHAR(128) DEFAULT NULL,
+#   item_sku VARCHAR(128) DEFAULT NULL,
+#   qty INT NOT NULL,
+#   txn_type VARCHAR(32) NOT NULL,
+#   location_id INT DEFAULT NULL,
+#   from_location_id INT DEFAULT NULL,
+#   to_location_id INT DEFAULT NULL,
+#   reference VARCHAR(255) DEFAULT NULL,
+#   batch_no VARCHAR(128) DEFAULT NULL,
+#   created_by VARCHAR(128) DEFAULT NULL,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   notes TEXT,
+#   INDEX idx_ledger_sku (sku),
+#   INDEX idx_ledger_item_sku (item_sku),
+#   CONSTRAINT fk_ledger_from_loc FOREIGN KEY (from_location_id) REFERENCES locations(id) ON DELETE SET NULL,
+#   CONSTRAINT fk_ledger_to_loc FOREIGN KEY (to_location_id) REFERENCES locations(id) ON DELETE SET NULL
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS inventory_counts (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   count_no VARCHAR(128) NOT NULL UNIQUE,
+#   performed_by VARCHAR(128),
+#   location_id INT DEFAULT NULL,
+#   notes TEXT,
+#   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#   CONSTRAINT fk_counts_loc FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+# CREATE TABLE IF NOT EXISTS inventory_count_lines (
+#   id INT AUTO_INCREMENT PRIMARY KEY,
+#   count_id INT NOT NULL,
+#   item_sku VARCHAR(128) NOT NULL,
+#   counted_qty INT NOT NULL,
+#   expected_qty INT DEFAULT NULL,
+#   variance INT AS (counted_qty - IFNULL(expected_qty,0)) STORED,
+#   notes TEXT,
+#   CONSTRAINT fk_count_lines_count FOREIGN KEY (count_id) REFERENCES inventory_counts(id) ON DELETE CASCADE,
+#   CONSTRAINT fk_count_lines_item FOREIGN KEY (item_sku) REFERENCES items(sku) ON DELETE RESTRICT
+# ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

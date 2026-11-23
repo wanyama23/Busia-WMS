@@ -1,0 +1,434 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+      <h5 class="mb-0">Locations</h5>
+      <small class="text-muted">Bin / rack mapping</small>
+    </div>
+    <div>
+      <button class="btn btn-sm btn-primary" id="newLocationBtn" type="button">+ New</button>
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('export_locations') }}">Export CSV</a>
+    </div>
+  </div>
+
+  <div id="locationsGrid" class="row g-3">
+    {% if locations %}
+      {% for loc in locations %}
+        <div class="col-6 col-md-4 col-lg-3" data-code="{{ loc.code }}">
+          <div class="card p-3 h-100">
+            <div class="d-flex justify-content-between align-items-start">
+              <div>
+                <div class="fw-bold">{{ loc.name }}</div>
+                <div class="small text-muted">{{ loc.code }} · {{ loc.type or 'Storage' }}</div>
+              </div>
+              <div class="text-end">
+                <div class="badge bg-light text-dark">Cap: {{ loc.capacity or 0 }}</div>
+              </div>
+            </div>
+
+            {% if loc.description %}
+              <div class="mt-2 small text-muted">{{ loc.description }}</div>
+            {% endif %}
+
+            <div class="mt-3 d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary edit-location" type="button" data-code="{{ loc.code }}">Edit</button>
+              <button class="btn btn-sm btn-outline-danger delete-location" type="button" data-code="{{ loc.code }}">Delete</button>
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="col-12">
+        <div class="alert alert-info mb-0">No locations defined yet.</div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- New/Edit location modal (Bootstrap 5 markup) -->
+<div class="modal fade" id="locationModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form id="locationForm" class="needs-validation" novalidate>
+        <div class="modal-header">
+          <h6 class="modal-title" id="locationModalTitle">New location</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+
+        <div class="modal-body">
+          <input type="hidden" id="loc_original_code" value="">
+
+          <div class="mb-2">
+            <label for="loc_code" class="form-label small">Code (optional)</label>
+            <input id="loc_code" name="code" class="form-control" placeholder="e.g. A-01-01">
+            <div class="form-text small">Leave empty to auto-generate a unique code.</div>
+          </div>
+
+          <div class="mb-2">
+            <label for="loc_name" class="form-label small">Name *</label>
+            <input id="loc_name" name="name" class="form-control" placeholder="Receiving Bay" required>
+            <div class="invalid-feedback">Name is required.</div>
+          </div>
+
+          <div class="mb-2">
+            <label for="loc_type" class="form-label small">Type</label>
+            <select id="loc_type" name="type" class="form-select">
+              <option value="Storage">Storage</option>
+              <option value="Receiving">Receiving</option>
+              <option value="Picking">Picking</option>
+              <option value="Dispatch">Dispatch</option>
+              <option value="Other">Other</option>
+            </select>
+          </div>
+
+          <div class="mb-2">
+            <label for="loc_capacity" class="form-label small">Capacity</label>
+            <input id="loc_capacity" name="capacity" type="number" class="form-control" value="0" min="0">
+          </div>
+
+          <div class="mb-2">
+            <label for="loc_description" class="form-label small">Description</label>
+            <textarea id="loc_description" name="description" class="form-control" rows="2" placeholder="Optional description"></textarea>
+          </div>
+
+          <div id="locFormAlert" class="alert alert-danger d-none" role="alert" aria-live="polite"></div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="saveLocation">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Delete confirmation modal -->
+<div class="modal fade" id="confirmDeleteModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content p-3">
+      <div class="modal-body">
+        <p class="mb-2">Are you sure you want to delete this location?</p>
+        <div id="deleteInfo" class="small text-muted mb-2"></div>
+        <div id="deleteAlert" class="alert alert-danger d-none" role="alert"></div>
+        <div class="d-flex justify-content-end gap-2">
+          <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button id="confirmDeleteBtn" class="btn btn-sm btn-danger">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const newBtn = document.getElementById('newLocationBtn');
+  const modalEl = document.getElementById('locationModal');
+  const form = document.getElementById('locationForm');
+  const saveBtn = document.getElementById('saveLocation');
+  const alertBox = document.getElementById('locFormAlert');
+  const grid = document.getElementById('locationsGrid');
+  const modalTitle = document.getElementById('locationModalTitle');
+  const originalCodeInput = document.getElementById('loc_original_code');
+
+  const deleteModalEl = document.getElementById('confirmDeleteModal');
+  const deleteInfo = document.getElementById('deleteInfo');
+  const deleteAlert = document.getElementById('deleteAlert');
+  const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
+
+  const bsModal = (typeof bootstrap !== 'undefined' && bootstrap.Modal) ? new bootstrap.Modal(modalEl, { backdrop: 'static' }) : null;
+  const bsDeleteModal = (typeof bootstrap !== 'undefined' && bootstrap.Modal) ? new bootstrap.Modal(deleteModalEl, { backdrop: 'static' }) : null;
+
+  const existingCodes = new Set(Array.from(grid.querySelectorAll('[data-code]')).map(el => el.getAttribute('data-code')));
+
+  // Read CSRF token from meta tag
+  const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+  const CSRF_TOKEN = csrfMeta ? csrfMeta.getAttribute('content') : null;
+
+  function headersJson() {
+    const h = { 'Content-Type': 'application/json' };
+    if (CSRF_TOKEN) {
+      h['X-CSRFToken'] = CSRF_TOKEN;
+      h['X-CSRF-Token'] = CSRF_TOKEN;
+    }
+    return h;
+  }
+
+  function showAlert(msg) {
+    alertBox.textContent = msg;
+    alertBox.classList.remove('d-none');
+  }
+
+  // Open create modal
+  newBtn.addEventListener('click', () => {
+    alertBox.classList.add('d-none');
+    form.classList.remove('was-validated');
+    form.reset();
+    originalCodeInput.value = '';
+    modalTitle.textContent = 'New location';
+    document.getElementById('loc_type').value = 'Storage';
+    document.getElementById('loc_capacity').value = 0;
+    if (bsModal) bsModal.show(); else modalEl.classList.add('show','d-block');
+    setTimeout(()=> document.getElementById('loc_code').focus(), 150);
+  });
+
+  // Delegate edit/delete button clicks
+  grid.addEventListener('click', function (e) {
+    const editBtn = e.target.closest('.edit-location');
+    const delBtn = e.target.closest('.delete-location');
+
+    if (editBtn) {
+      const code = editBtn.getAttribute('data-code');
+      openEditModal(code);
+    } else if (delBtn) {
+      const code = delBtn.getAttribute('data-code');
+      openDeleteModal(code);
+    }
+  });
+
+  // Prefill and open edit modal
+  function openEditModal(code) {
+    alertBox.classList.add('d-none');
+    form.classList.remove('was-validated');
+    const cardCol = grid.querySelector(`[data-code="${code}"]`);
+    if (!cardCol) return showAlert('Location not found in page');
+    const name = cardCol.querySelector('.fw-bold')?.textContent || '';
+    const meta = cardCol.querySelector('.small.text-muted')?.textContent || '';
+    const capBadge = cardCol.querySelector('.badge')?.textContent || '';
+    const desc = cardCol.querySelector('.mt-2.small.text-muted')?.textContent || '';
+
+    const parts = meta.split('·').map(s => s.trim());
+    const type = parts.length > 1 ? parts[1] : 'Storage';
+
+    originalCodeInput.value = code;
+    document.getElementById('loc_code').value = code;
+    document.getElementById('loc_name').value = name;
+    document.getElementById('loc_type').value = type;
+    const capMatch = (capBadge || '').match(/Cap:\s*(\d+)/);
+    document.getElementById('loc_capacity').value = capMatch ? parseInt(capMatch[1],10) : 0;
+    document.getElementById('loc_description').value = desc || '';
+
+    modalTitle.textContent = 'Edit location';
+    if (bsModal) bsModal.show(); else modalEl.classList.add('show','d-block');
+    setTimeout(()=> document.getElementById('loc_name').focus(), 150);
+  }
+
+  // Open delete confirmation modal
+  let codeToDelete = null;
+  function openDeleteModal(code) {
+    codeToDelete = code;
+    deleteAlert.classList.add('d-none');
+    const cardCol = grid.querySelector(`[data-code="${code}"]`);
+    const name = cardCol?.querySelector('.fw-bold')?.textContent || code;
+    deleteInfo.textContent = `${name} (${code})`;
+    if (bsDeleteModal) bsDeleteModal.show(); else deleteModalEl.classList.add('show','d-block');
+  }
+
+  // Confirm delete
+  confirmDeleteBtn.addEventListener('click', async function () {
+    if (!codeToDelete) return;
+    confirmDeleteBtn.disabled = true;
+    confirmDeleteBtn.textContent = 'Deleting...';
+    try {
+      const res = await fetch(`/api/locations/${encodeURIComponent(codeToDelete)}`, {
+        method: 'DELETE',
+        headers: headersJson(),
+        credentials: 'same-origin'
+      });
+      const j = await res.json().catch(()=>({ status:'error', message:'Invalid response' }));
+      if (res.ok && j.status === 'ok') {
+        const col = grid.querySelector(`[data-code="${codeToDelete}"]`);
+        if (col) col.remove();
+        existingCodes.delete(codeToDelete);
+        if (bsDeleteModal) bsDeleteModal.hide(); else deleteModalEl.classList.remove('show','d-block');
+      } else {
+        deleteAlert.textContent = j.message || 'Failed to delete location';
+        deleteAlert.classList.remove('d-none');
+      }
+    } catch (err) {
+      deleteAlert.textContent = 'Network error. Try again.';
+      deleteAlert.classList.remove('d-none');
+    } finally {
+      confirmDeleteBtn.disabled = false;
+      confirmDeleteBtn.textContent = 'Delete';
+      codeToDelete = null;
+    }
+  });
+
+  // Create or update handler
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    alertBox.classList.add('d-none');
+    form.classList.add('was-validated');
+
+    const originalCode = (originalCodeInput.value || '').trim();
+    const code = (document.getElementById('loc_code').value || '').trim();
+    const name = (document.getElementById('loc_name').value || '').trim();
+    const type = (document.getElementById('loc_type').value || '').trim();
+    const capacity = parseInt(document.getElementById('loc_capacity').value || 0, 10) || 0;
+    const description = (document.getElementById('loc_description').value || '').trim();
+
+    if (!name) {
+      showAlert('Name is required.');
+      return;
+    }
+
+    if (code && code !== originalCode && existingCodes.has(code)) {
+      showAlert('A location with this code already exists.');
+      return;
+    }
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    try {
+      const payload = { code, name, type, capacity, description };
+
+      let res, j;
+      if (originalCode) {
+        res = await fetch(`/api/locations/${encodeURIComponent(originalCode)}`, {
+          method: 'PUT',
+          headers: headersJson(),
+          body: JSON.stringify(payload),
+          credentials: 'same-origin'
+        });
+        j = await res.json().catch(()=>({ status:'error', message:'Invalid response' }));
+      } else {
+        res = await fetch('{{ url_for("api_create_location") }}', {
+          method: 'POST',
+          headers: headersJson(),
+          body: JSON.stringify(payload),
+          credentials: 'same-origin'
+        });
+        j = await res.json().catch(()=>({ status:'error', message:'Invalid response' }));
+      }
+
+      if (res.ok && j.status === 'ok' && j.location) {
+        const loc = j.location;
+        const existingCol = grid.querySelector(`[data-code="${originalCode || loc.code}"]`);
+        if (existingCol && originalCode) {
+          if (loc.code && loc.code !== originalCode) {
+            existingCol.remove();
+            existingCodes.delete(originalCode);
+            insertLocationCard(loc);
+          } else {
+            updateLocationCard(existingCol, loc);
+          }
+        } else {
+          insertLocationCard(loc);
+        }
+
+        existingCodes.add(loc.code);
+        alertBox.classList.remove('d-none');
+        alertBox.classList.remove('alert-danger');
+        alertBox.classList.add('alert-success');
+        alertBox.textContent = originalCode ? 'Location updated.' : 'Location created. Code: ' + (loc.code || code);
+
+        setTimeout(() => {
+          if (bsModal) bsModal.hide(); else modalEl.classList.remove('show','d-block');
+          alertBox.classList.add('d-none');
+        }, 700);
+      } else {
+        showAlert(j.message || 'Failed to save location');
+      }
+    } catch (err) {
+      console.error(err);
+      showAlert('Network error. Try again.');
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save';
+      originalCodeInput.value = '';
+    }
+  });
+
+  // Helpers to update/insert DOM cards
+  function updateLocationCard(col, loc) {
+    const title = col.querySelector('.fw-bold');
+    const meta = col.querySelector('.small.text-muted');
+    const badge = col.querySelector('.badge');
+    const descEl = col.querySelector('.mt-2.small.text-muted');
+
+    if (title) title.textContent = loc.name;
+    if (meta) meta.textContent = `${loc.code} · ${loc.type || 'Storage'}`;
+    if (badge) badge.textContent = 'Cap: ' + (loc.capacity || 0);
+    if (loc.description) {
+      if (descEl) descEl.textContent = loc.description;
+      else {
+        const d = document.createElement('div');
+        d.className = 'mt-2 small text-muted';
+        d.textContent = loc.description;
+        col.querySelector('.card').appendChild(d);
+      }
+    } else if (descEl) {
+      descEl.remove();
+    }
+    col.setAttribute('data-code', loc.code);
+    const editBtn = col.querySelector('.edit-location');
+    const delBtn = col.querySelector('.delete-location');
+    if (editBtn) editBtn.setAttribute('data-code', loc.code);
+    if (delBtn) delBtn.setAttribute('data-code', loc.code);
+  }
+
+  function insertLocationCard(loc) {
+    const col = document.createElement('div');
+    col.className = 'col-6 col-md-4 col-lg-3';
+    col.setAttribute('data-code', loc.code);
+
+    const card = document.createElement('div');
+    card.className = 'card p-3 h-100';
+
+    const top = document.createElement('div');
+    top.className = 'd-flex justify-content-between align-items-start';
+
+    const left = document.createElement('div');
+    const title = document.createElement('div');
+    title.className = 'fw-bold';
+    title.textContent = loc.name;
+    const meta = document.createElement('div');
+    meta.className = 'small text-muted';
+    meta.textContent = `${loc.code} · ${loc.type || 'Storage'}`;
+    left.appendChild(title);
+    left.appendChild(meta);
+
+    const right = document.createElement('div');
+    right.className = 'text-end';
+    const badge = document.createElement('div');
+    badge.className = 'badge bg-light text-dark';
+    badge.textContent = 'Cap: ' + (loc.capacity || 0);
+    right.appendChild(badge);
+
+    top.appendChild(left);
+    top.appendChild(right);
+    card.appendChild(top);
+
+    if (loc.description) {
+      const desc = document.createElement('div');
+      desc.className = 'mt-2 small text-muted';
+      desc.textContent = loc.description;
+      card.appendChild(desc);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'mt-3 d-flex gap-2';
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn btn-sm btn-outline-primary edit-location';
+    editBtn.type = 'button';
+    editBtn.setAttribute('data-code', loc.code);
+    editBtn.textContent = 'Edit';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-sm btn-outline-danger delete-location';
+    delBtn.type = 'button';
+    delBtn.setAttribute('data-code', loc.code);
+    delBtn.textContent = 'Delete';
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+
+    col.appendChild(card);
+    grid.insertAdjacentElement('afterbegin', col);
+  }
+});
+</script>
+
+{% endblock %}

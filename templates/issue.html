@@ -1,0 +1,366 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container-fluid">
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-start mb-2">
+      <div>
+        <h5 class="mb-0">Delivery Note</h5>
+        <small class="text-muted">Issue & Dispatch</small>
+      </div>
+    </div>
+
+    <div class="row g-2">
+      <div class="col-md-4">
+        <label class="form-label small">Delivery Note No</label>
+        <input id="delivery_no" class="form-control" placeholder="Assigned on confirm" readonly>
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label small">Order / PO Ref</label>
+        <input id="order_ref" class="form-control" placeholder="Assigned on confirm" readonly>
+      </div>
+
+      <div class="col-md-4">
+        <label class="form-label small">Recipient name *</label>
+        <input id="recipient" class="form-control" placeholder="Recipient name" required>
+      </div>
+
+      <div class="col-md-4 mt-2">
+        <label class="form-label small">Recipient phone</label>
+        <input id="recipient_phone" type="tel" class="form-control" placeholder="e.g. 07XX XXX XXX">
+      </div>
+
+      <div class="col-md-4 mt-2">
+        <label class="form-label small">Recipient email</label>
+        <input id="recipient_email" type="email" class="form-control" placeholder="e.g. recipient@example.com">
+        <small class="text-muted">If set, a PDF copy of the delivery note is emailed here.</small>
+      </div>
+
+      <div class="col-md-4 mt-2">
+        <label class="form-label small">Delivery address</label>
+        <input id="address" class="form-control" placeholder="Delivery address">
+      </div>
+
+      <div class="col-md-4 mt-2">
+        <label class="form-label small">Vehicle</label>
+        <select id="vehicle_id" class="form-select">
+          <option value="">Select vehicle</option>
+          {% for v in vehicles %}
+            <option value="{{ v.id }}">{{ v.reg_no }}{% if v.make_model %} — {{ v.make_model }}{% endif %}</option>
+          {% endfor %}
+        </select>
+        <input id="vehicle_reg_other" class="form-control form-control-sm mt-1" placeholder="Or type reg no if not listed">
+      </div>
+
+      <div class="col-md-4 mt-2">
+        <label class="form-label small">Driver</label>
+        <select id="driver_id" class="form-select">
+          <option value="">Select driver</option>
+          {% for d in drivers %}
+            <option value="{{ d.id }}" data-phone="{{ d.phone or '' }}">{{ d.name }}{% if d.phone %} — {{ d.phone }}{% endif %}</option>
+          {% endfor %}
+        </select>
+        <input id="driver_name_other" class="form-control form-control-sm mt-1" placeholder="Or type driver name if not listed">
+        <input id="driver_phone_other" class="form-control form-control-sm mt-1" placeholder="Driver phone (if typed above)">
+      </div>
+
+      <div class="col-md-12 mt-2">
+        <label class="form-label small">Remarks</label>
+        <textarea id="remarks" class="form-control" rows="2" placeholder="Optional remarks"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-0">Items to issue</h6>
+      <div>
+        <button class="btn btn-sm btn-secondary" id="addIssueLine">+ Add line</button>
+      </div>
+    </div>
+
+    <form id="issueForm">
+      <div id="issueLines" class="mb-3"></div>
+
+      <div id="issueAlert" class="alert alert-danger d-none" role="alert"></div>
+      <div id="issueSuccess" class="alert alert-success d-none" role="alert"></div>
+
+      <div class="d-flex justify-content-between">
+        <div>
+          <button type="button" class="btn btn-outline-secondary" id="clearLines">Clear</button>
+        </div>
+        <div>
+          <button type="submit" class="btn btn-dark" id="confirmIssue">Confirm pick & generate delivery note</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- line template -->
+<script type="text/template" id="issue-line-template">
+  <div class="row g-2 mb-2 issue-line align-items-center">
+    <div class="col-12 col-md-4">
+      <label class="form-label small d-md-none">Item SKU</label>
+      <select class="form-select form-select-sm i_sku" name="i_sku">
+        <option value="">Select SKU</option>
+        {% for it in items %}
+          <option value="{{ it.sku }}">{{ it.sku }} — {{ it.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="col-4 col-md-2">
+      <label class="form-label small d-md-none">Qty</label>
+      <input type="number" class="form-control form-control-sm i_qty" name="i_qty" value="1" min="1" step="1">
+    </div>
+
+    <div class="col-4 col-md-3">
+      <label class="form-label small d-md-none">Location</label>
+      <select class="form-select form-select-sm i_location" name="i_location">
+        <option value="">Any</option>
+        {% for loc in locations %}
+          <option value="{{ loc }}">{{ loc }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="col-6 col-md-2">
+      <label class="form-label small d-md-none">Batch ID</label>
+      <input type="text" class="form-control form-control-sm i_batch" name="i_batch" placeholder="Batch ID (optional)">
+    </div>
+
+    <div class="col-6 col-md-1 text-end">
+      <button type="button" class="btn btn-danger btn-sm remove-line" title="Remove line">×</button>
+    </div>
+  </div>
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const deliveryNoInput = document.getElementById('delivery_no');
+  const orderRefInput = document.getElementById('order_ref');
+  const addBtn = document.getElementById('addIssueLine');
+  const linesContainer = document.getElementById('issueLines');
+  const template = document.getElementById('issue-line-template').innerHTML;
+  const form = document.getElementById('issueForm');
+  const alertBox = document.getElementById('issueAlert');
+  const successBox = document.getElementById('issueSuccess');
+  const clearBtn = document.getElementById('clearLines');
+  const driverSelect = document.getElementById('driver_id');
+  const driverPhoneOther = document.getElementById('driver_phone_other');
+
+  // auto-fill the typed driver-phone box from the selected driver, as a convenience
+  driverSelect.addEventListener('change', function () {
+    const opt = driverSelect.options[driverSelect.selectedIndex];
+    const phone = opt ? opt.getAttribute('data-phone') : '';
+    if (phone) driverPhoneOther.value = phone;
+  });
+
+  function addLine() {
+    linesContainer.insertAdjacentHTML('beforeend', template);
+    const last = linesContainer.querySelector('.issue-line:last-child .i_sku');
+    if (last) last.focus();
+  }
+  addLine();
+
+  addBtn.addEventListener('click', addLine);
+  clearBtn.addEventListener('click', () => { linesContainer.innerHTML = ''; addLine(); });
+
+  document.addEventListener('click', function (e) {
+    if (e.target && e.target.classList.contains('remove-line')) {
+      const row = e.target.closest('.issue-line');
+      if (row) row.remove();
+    }
+  });
+
+  function clearLineErrors() {
+    linesContainer.querySelectorAll('.issue-line').forEach(row => {
+      row.classList.remove('line-error');
+      const errEl = row.querySelector('.line-error-text');
+      if (errEl) errEl.remove();
+    });
+  }
+
+  function showLineErrors(errors) {
+    clearLineErrors();
+    Object.keys(errors).forEach(idxStr => {
+      const idx = parseInt(idxStr, 10);
+      const row = linesContainer.querySelectorAll('.issue-line')[idx];
+      if (!row) return;
+      row.classList.add('line-error');
+      const el = document.createElement('div');
+      el.className = 'line-error-text small text-danger mt-1';
+      el.textContent = errors[idxStr].join('; ');
+      row.appendChild(el);
+    });
+  }
+
+  function getCsrfToken() {
+    const m = document.querySelector('meta[name="csrf-token"]');
+    return m ? m.getAttribute('content') : null;
+  }
+
+  function showResult(delivery_id, delivery_no, order_ref, emailed, recipientEmail) {
+    deliveryNoInput.value = delivery_no;
+    orderRefInput.value = order_ref;
+
+    successBox.innerHTML = '';
+    successBox.classList.remove('d-none');
+    alertBox.classList.add('d-none');
+
+    const msg = document.createElement('div');
+    msg.textContent = 'Delivery note ' + delivery_no + ' confirmed and stock updated.' +
+      (emailed ? (' A PDF copy is being emailed to ' + recipientEmail + '.') : '');
+    successBox.appendChild(msg);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'mt-2 d-flex gap-2';
+
+    const printBtn = document.createElement('a');
+    printBtn.href = '/delivery/' + encodeURIComponent(delivery_no);
+    printBtn.target = '_blank';
+    printBtn.className = 'btn btn-sm btn-outline-dark';
+    printBtn.textContent = 'Print delivery note';
+    btnRow.appendChild(printBtn);
+
+    const pdfBtn = document.createElement('a');
+    pdfBtn.href = '/issue/' + delivery_id + '/pdf';
+    pdfBtn.target = '_blank';
+    pdfBtn.className = 'btn btn-sm btn-outline-primary';
+    pdfBtn.textContent = 'Download PDF';
+    btnRow.appendChild(pdfBtn);
+
+    successBox.appendChild(btnRow);
+  }
+
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    alertBox.classList.add('d-none');
+    successBox.classList.add('d-none');
+    clearLineErrors();
+
+    const recipient = document.getElementById('recipient').value.trim();
+    const recipient_phone = document.getElementById('recipient_phone').value.trim();
+    const recipient_email = document.getElementById('recipient_email').value.trim();
+    const address = document.getElementById('address').value.trim();
+    const remarks = document.getElementById('remarks').value.trim();
+
+    const vehicle_id = document.getElementById('vehicle_id').value || null;
+    const vehicle_reg = document.getElementById('vehicle_reg_other').value.trim();
+    const driver_id = driverSelect.value || null;
+    const driver_name = document.getElementById('driver_name_other').value.trim();
+    const driver_phone = driverPhoneOther.value.trim();
+
+    if (!recipient) {
+      alertBox.textContent = 'Recipient name is required.';
+      alertBox.classList.remove('d-none');
+      return;
+    }
+
+    const lines = Array.from(linesContainer.querySelectorAll('.issue-line')).map(row => ({
+      sku: (row.querySelector('.i_sku') || {}).value || '',
+      qty: parseInt((row.querySelector('.i_qty') || {}).value || 0, 10) || 0,
+      location: (row.querySelector('.i_location') || {}).value || '',
+      batch_id: (row.querySelector('.i_batch') || {}).value || '',
+    }));
+
+    if (!lines.some(l => l.sku && l.qty > 0)) {
+      alertBox.textContent = 'Add at least one valid line with SKU and quantity.';
+      alertBox.classList.remove('d-none');
+      return;
+    }
+
+    const payload = {
+      recipient, recipient_phone, recipient_email, address, remarks,
+      vehicle_id, vehicle_reg, driver_id, driver_name, driver_phone,
+      lines
+    };
+
+    if (!navigator.onLine) {
+      const q = JSON.parse(localStorage.getItem('wms_queue') || '[]');
+      q.push({ action: 'issue', payload, ts: Date.now() });
+      localStorage.setItem('wms_queue', JSON.stringify(q));
+      alert('Offline: request queued. It will submit automatically once you are back online.');
+      form.reset();
+      linesContainer.innerHTML = '';
+      addLine();
+      return;
+    }
+
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      const csrf = getCsrfToken();
+      if (csrf) headers['X-CSRFToken'] = csrf;
+
+      const res = await fetch('/api/issue', { method: 'POST', headers, body: JSON.stringify(payload) });
+      const j = await res.json().catch(() => ({ status: 'error', message: 'Invalid server response' }));
+
+      if (res.ok && j.status === 'ok') {
+        showResult(j.delivery_id, j.delivery_no, j.order_ref, j.email_queued, recipient_email);
+      } else if (res.status === 400 && j.errors) {
+        showLineErrors(j.errors);
+        alertBox.textContent = j.message || 'Validation errors on some lines';
+        alertBox.classList.remove('d-none');
+      } else {
+        alertBox.textContent = j.message || 'Failed to create delivery note';
+        alertBox.classList.remove('d-none');
+      }
+    } catch (err) {
+      console.error(err);
+      alertBox.textContent = 'Network error while confirming the delivery.';
+      alertBox.classList.remove('d-none');
+    }
+  });
+
+  // -------------------------
+  // Background sync: flush wms_queue when online
+  // -------------------------
+  async function flushQueue() {
+    const qRaw = localStorage.getItem('wms_queue');
+    if (!qRaw) return;
+    let queue;
+    try { queue = JSON.parse(qRaw) || []; } catch (e) { localStorage.removeItem('wms_queue'); return; }
+    if (!queue.length) return;
+
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      if (!item || !item.action || !item.payload) continue;
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        const csrf = getCsrfToken();
+        if (csrf) headers['X-CSRFToken'] = csrf;
+
+        if (item.action === 'issue') {
+          const res = await fetch('/api/issue', { method: 'POST', headers, body: JSON.stringify(item.payload) });
+          const j = await res.json().catch(() => ({ status: 'error' }));
+          if (res.ok && j.status === 'ok') {
+            queue.splice(i, 1); i--; localStorage.setItem('wms_queue', JSON.stringify(queue));
+            console.info('Flushed queued issue:', j.delivery_no);
+          } else if (res.status === 400 && j.errors) {
+            queue.splice(i, 1); i--; localStorage.setItem('wms_queue', JSON.stringify(queue));
+            console.warn('Queued issue had validation errors and was removed', j);
+          } else {
+            console.warn('Server rejected queued item, will retry later', j);
+            break;
+          }
+        } else {
+          queue.splice(i, 1); i--; localStorage.setItem('wms_queue', JSON.stringify(queue));
+        }
+      } catch (err) {
+        console.error('Failed to flush queue item, will retry later', err);
+        break;
+      }
+    }
+  }
+
+  if (navigator.onLine) flushQueue().catch(() => {});
+  window.addEventListener('online', () => flushQueue().catch(() => {}));
+});
+</script>
+
+<style>
+.issue-line.line-error { background: #fff6f6; border-left: 4px solid #e55353; padding-left: .5rem; }
+.line-error-text { display: block; }
+</style>
+{% endblock %}

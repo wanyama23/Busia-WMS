@@ -1,0 +1,288 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container-fluid">
+  <div class="row g-3">
+    <!-- GRN header -->
+    <div class="col-lg-5">
+      <div class="card p-3">
+        <h6 class="mb-3">Goods Receipt Note</h6>
+
+        <div class="mb-2">
+          <label class="form-label small">GRN No</label>
+          <input id="grn_no" class="form-control" placeholder="Assigned on confirm" readonly>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Order / PO Ref</label>
+          <input id="po_ref" class="form-control" placeholder="Auto-generated if left blank">
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Supplier *</label>
+          <input id="supplier" class="form-control" placeholder="Supplier name" required>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Supplier Email *</label>
+          <input id="supplier_email" type="email" class="form-control" placeholder="e.g. orders@supplier.com" required>
+          <small class="text-muted">The confirmed GRN PDF is emailed here when goods are in good condition.</small>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Condition on receipt</label>
+          <select id="condition_check" class="form-select">
+            <option value="good">Good condition</option>
+            <option value="damaged">Damaged / discrepancy noted</option>
+          </select>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Condition notes (optional)</label>
+          <textarea id="condition_notes" class="form-control" rows="2" placeholder="Note any damage, shortages, or discrepancies"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- Items received -->
+    <div class="col-lg-7">
+      <div class="card p-3">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h6 class="mb-0">Items received</h6>
+          <div>
+            <button type="button" class="btn btn-sm btn-secondary" id="addReceiveLine">+ Add line</button>
+          </div>
+        </div>
+
+        <form id="receiveForm">
+          <div id="receiveLines" class="mb-3"></div>
+
+          <div id="receiveAlert" class="alert alert-danger d-none" role="alert"></div>
+          <div id="receiveSuccess" class="alert alert-success d-none" role="alert"></div>
+
+          <input type="hidden" id="receipt-id" value="">
+
+          <div class="d-flex justify-content-end gap-2">
+            <button type="submit" class="btn btn-primary" id="confirm-receipt">
+              Confirm receipt &amp; update stock
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Template for one received line -->
+<script type="text/template" id="receive-line-template">
+  <div class="row g-2 mb-2 receive-line align-items-center">
+    <div class="col-12 col-md-5">
+      <label class="form-label small d-md-none">Item SKU</label>
+      <select class="form-select form-select-sm r_sku" name="r_sku">
+        <option value="">Select SKU</option>
+        {% for it in items %}
+          <option value="{{ it.sku }}">{{ it.sku }} — {{ it.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="col-4 col-md-2">
+      <label class="form-label small d-md-none">Qty</label>
+      <input type="number" class="form-control form-control-sm r_qty" name="r_qty" value="1" min="0.01" step="0.01">
+    </div>
+
+    <div class="col-4 col-md-2">
+      <label class="form-label small d-md-none">Unit</label>
+      <input type="text" class="form-control form-control-sm r_unit" name="r_unit" value="pcs">
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Batch ID</label>
+      <input type="text" class="form-control form-control-sm r_batch" name="r_batch" placeholder="Batch ID (optional)">
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Location</label>
+      <select class="form-select form-select-sm r_location" name="r_location">
+        <option value="">Select location</option>
+        {% for loc in locations %}
+          <option value="{{ loc }}">{{ loc }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Expiry</label>
+      <input type="date" class="form-control form-control-sm r_expiry">
+    </div>
+
+    <div class="col-2 col-md-1 text-end">
+      <button type="button" class="btn btn-danger btn-sm remove-line" title="Remove line">×</button>
+    </div>
+  </div>
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+
+  // ---------------------------------------------------------------
+  // DEFENSIVE: strip any pre-existing submit/click listeners that
+  // another script (e.g. a stale static/js/app.js) may have already
+  // attached to this form or its confirm button — those are what's
+  // been sending POST /api/receive/confirm. Cloning a node drops all
+  // event listeners attached to the original; listeners added later
+  // in THIS script attach fresh, to a clean node.
+  // ---------------------------------------------------------------
+  (function stripForeignHandlers() {
+    const oldForm = document.getElementById('receiveForm');
+    const newForm = oldForm.cloneNode(true);
+    oldForm.parentNode.replaceChild(newForm, oldForm);
+  })();
+
+  const linesContainer = document.getElementById('receiveLines');
+  const lineTemplate = document.getElementById('receive-line-template').innerHTML;
+  const alertBox = document.getElementById('receiveAlert');
+  const successBox = document.getElementById('receiveSuccess');
+  const form = document.getElementById('receiveForm'); // the freshly-cloned node
+
+  function addLine() {
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = lineTemplate;
+    linesContainer.appendChild(wrapper.firstElementChild);
+  }
+
+  document.getElementById('addReceiveLine').addEventListener('click', addLine);
+  linesContainer.addEventListener('click', function (e) {
+    if (e.target.classList.contains('remove-line')) {
+      e.target.closest('.receive-line').remove();
+    }
+  });
+
+  addLine();
+
+  function collectLines() {
+    return Array.from(linesContainer.querySelectorAll('.receive-line')).map(row => ({
+      sku: row.querySelector('.r_sku').value,
+      qty: parseFloat(row.querySelector('.r_qty').value) || 0,
+      unit: row.querySelector('.r_unit').value,
+      batch: row.querySelector('.r_batch').value,
+      location: row.querySelector('.r_location').value,
+      expiry: row.querySelector('.r_expiry').value
+    }));
+  }
+
+  function getCsrfToken() {
+    const m = document.querySelector('meta[name="csrf-token"]');
+    return m ? m.getAttribute('content') : null;
+  }
+
+  function showAlert(msg) {
+    alertBox.textContent = msg;
+    alertBox.classList.remove('d-none');
+    successBox.classList.add('d-none');
+  }
+
+  function showResult(receiptId, grnNo, orderRef, emailed, supplierEmail) {
+    document.getElementById('grn_no').value = grnNo;
+    document.getElementById('po_ref').value = orderRef;
+    document.getElementById('receipt-id').value = receiptId;
+
+    successBox.innerHTML = '';
+    successBox.classList.remove('d-none');
+    alertBox.classList.add('d-none');
+
+    const msg = document.createElement('div');
+    msg.textContent = 'Confirmed. GRN ' + grnNo + ' — stock updated.' +
+      (emailed ? (' A PDF copy is being emailed to ' + supplierEmail + '.') :
+                 ' No email was sent (condition was marked as damaged/discrepancy).');
+    successBox.appendChild(msg);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'mt-2 d-flex gap-2';
+
+    const printBtn = document.createElement('a');
+    printBtn.href = '/receipt/' + encodeURIComponent(grnNo);
+    printBtn.target = '_blank';
+    printBtn.className = 'btn btn-sm btn-outline-dark';
+    printBtn.textContent = 'Print GRN';
+    btnRow.appendChild(printBtn);
+
+    const pdfBtn = document.createElement('a');
+    pdfBtn.href = '/receive/' + receiptId + '/pdf';
+    pdfBtn.target = '_blank';
+    pdfBtn.className = 'btn btn-sm btn-outline-primary';
+    pdfBtn.textContent = 'Download PDF';
+    btnRow.appendChild(pdfBtn);
+
+    successBox.appendChild(btnRow);
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    e.stopImmediatePropagation(); // belt-and-braces: block any other listener on this exact event
+
+    const payload = {
+      supplier: document.getElementById('supplier').value,
+      supplier_email: document.getElementById('supplier_email').value,
+      po_ref: document.getElementById('po_ref').value,
+      condition: document.getElementById('condition_check').value,
+      condition_notes: document.getElementById('condition_notes').value,
+      lines: collectLines(),
+      confirmed_by: window.currentUser || 'web'
+    };
+
+    if (!payload.supplier || !payload.supplier_email) {
+      showAlert('Supplier name and email are required.');
+      return;
+    }
+    if (payload.lines.length === 0 || payload.lines.every(l => !l.sku)) {
+      showAlert('Add at least one received line before confirming.');
+      return;
+    }
+
+    const btn = document.getElementById('confirm-receipt');
+    btn.disabled = true;
+    btn.textContent = 'Confirming...';
+
+    const headers = { 'Content-Type': 'application/json' };
+    const csrf = getCsrfToken();
+    if (csrf) headers['X-CSRFToken'] = csrf;
+
+    const ENDPOINT = '/api/receive'; // <-- the ONLY URL this form will ever call
+    console.log('[receive.html] submitting to', ENDPOINT);
+
+    fetch(ENDPOINT, { method: 'POST', headers, body: JSON.stringify(payload) })
+      .then(async (res) => {
+        const raw = await res.text();
+        let j;
+        try {
+          j = JSON.parse(raw);
+        } catch (parseErr) {
+          // Server returned HTML/plain-text, not JSON — most likely a 404/500 page.
+          // Show the actual status instead of crashing with a parse error.
+          throw new Error(
+            `Server returned ${res.status} ${res.statusText} (not JSON) from ${ENDPOINT}. ` +
+            `This usually means a stale script is posting to a different URL — ` +
+            `check the Network tab's "Initiator" column for the failing request.`
+          );
+        }
+
+        btn.disabled = false;
+        btn.textContent = 'Confirm receipt & update stock';
+
+        if (!res.ok || j.status !== 'ok') {
+          showAlert('Error: ' + (j.message || j.detail || `HTTP ${res.status}`));
+          return;
+        }
+
+        showResult(j.receipt_id, j.grn_no, j.order_ref, j.email_queued, payload.supplier_email);
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.textContent = 'Confirm receipt & update stock';
+        console.error('[receive.html] submit failed:', err);
+        showAlert('Network error: ' + err.message);
+      });
+  });
+});
+</script>
+{% endblock %}

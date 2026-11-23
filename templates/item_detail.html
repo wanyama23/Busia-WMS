@@ -1,0 +1,49 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-start mb-3">
+    <div>
+      <h5 class="mb-0">{{ sku }}</h5>
+      <small class="text-muted">Item details</small>
+    </div>
+    <div>
+      {% if endpoint_exists('adjust_stock') %}
+        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('adjust_stock', sku=sku) }}">Adjust stock</a>
+      {% else %}
+        <button class="btn btn-sm btn-outline-secondary" disabled>Adjust stock</button>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-md-6">
+      <div class="card p-3">
+        <dl class="row mb-0">
+          <dt class="col-4 text-muted">SKU</dt><dd class="col-8">{{ sku }}</dd>
+          <dt class="col-4 text-muted">Name</dt><dd class="col-8">{{ item.name if item is defined else '-' }}</dd>
+          <dt class="col-4 text-muted">Unit</dt><dd class="col-8">{{ item.unit if item is defined else '-' }}</dd>
+          <dt class="col-4 text-muted">Category</dt><dd class="col-8">{{ item.category if item is defined else '-' }}</dd>
+          <dt class="col-4 text-muted">On hand</dt><dd class="col-8">{{ item.on_hand if item is defined else 0 }}</dd>
+          <dt class="col-4 text-muted">Reorder level</dt><dd class="col-8">{{ item.reorder_level if item is defined else '-' }}</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="col-md-6">
+      <div class="card p-3">
+        <h6 class="mb-2">Recent movements</h6>
+        <ul class="list-unstyled mb-0">
+          {% for m in movements %}
+            <li class="mb-2">
+              <div class="small text-muted">{{ m.when }}</div>
+              <div>{{ m.qty }} {{ item.unit if item is defined else '' }} — {{ m.txn_type }} ({{ m.location_id or '—' }})</div>
+            </li>
+          {% else %}
+            <li class="text-muted">No recent movements for this SKU.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

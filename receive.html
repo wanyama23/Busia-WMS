@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="csrf-token" content="ImUxZGJiZmRjNWY3MWY1MDBkN2U1Y2VkNWI3NTg2MGYxMGMyOWM3NDIi.aqvcUw.fSOCUEx0m-8fNSfaXgLZCjJ1yCQ">
+
+
+
+
+  <title>Busia WMS – Warehouse Control</title>
+  
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260902">
+  <link href="/static/css/style.css" rel="stylesheet">
+</head>
+<body>
+  <div class="app-shell d-flex">
+    <nav class="sidebar bg-dark text-white d-flex flex-column">
+      <div class="sidebar-brand px-3 py-4">
+        <h5 class="mb-0">Busia WMS</h5>
+        <small class="text-muted">Warehouse Control</small>
+      </div>
+
+      <ul class="nav flex-column px-2">
+        <li class="nav-item"><a class="nav-link text-white" href="/">Dashboard</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/items">Items</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/locations">Locations</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/receive">Receive</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/issue">Issue</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/item//adjust">Adjust</a></li>
+        <li class="nav-item"><a class="nav-link text-white" href="/ledger">Ledger</a></li>
+      </ul>
+
+      <div class="mt-auto px-3 py-3">
+        <div class="text-white small">User: <strong>guest</strong></div>
+      </div>
+    </nav>
+
+    <div class="main flex-grow-1">
+      <header class="topbar d-flex align-items-center justify-content-between px-4 py-3 border-bottom">
+        <div>
+          <h4 class="mb-0">Busia County Warehouse · live stock overview</h4>
+          <small class="text-muted">Real time inventory snapshot</small>
+        </div>
+        <div class="d-flex gap-2 align-items-center">
+          
+            <a class="btn btn-sm btn-primary" href="/receive">Receive</a>
+          
+          
+            <a class="btn btn-sm btn-outline-secondary" href="/issue">Issue</a>
+          
+        </div>
+      </header>
+
+      <main class="p-4">
+        
+<div class="container-fluid">
+  <div class="row g-3">
+    <!-- GRN header -->
+    <div class="col-lg-5">
+      <div class="card p-3">
+        <h6 class="mb-3">Goods Receipt Note</h6>
+
+        <div class="mb-2">
+          <label class="form-label small">GRN No</label>
+          <input id="grn_no" class="form-control" placeholder="Assigned on confirm" readonly>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Order / PO Ref</label>
+          <input id="po_ref" class="form-control" placeholder="Auto-generated if left blank">
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Supplier *</label>
+          <input id="supplier" class="form-control" placeholder="Supplier name" required>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Supplier Email *</label>
+          <input id="supplier_email" type="email" class="form-control" placeholder="e.g. orders@supplier.com" required>
+          <small class="text-muted">The confirmed GRN PDF is emailed here when goods are in good condition.</small>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Condition on receipt</label>
+          <select id="condition_check" class="form-select">
+            <option value="good">Good condition</option>
+            <option value="damaged">Damaged / discrepancy noted</option>
+          </select>
+        </div>
+
+        <div class="mb-2">
+          <label class="form-label small">Condition notes (optional)</label>
+          <textarea id="condition_notes" class="form-control" rows="2" placeholder="Note any damage, shortages, or discrepancies"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- Items received -->
+    <div class="col-lg-7">
+      <div class="card p-3">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h6 class="mb-0">Items received</h6>
+          <div>
+            <button class="btn btn-sm btn-secondary" id="addReceiveLine">+ Add line</button>
+          </div>
+        </div>
+
+        <form id="receiveForm">
+          <div id="receiveLines" class="mb-3"></div>
+
+          <div id="receiveAlert" class="alert alert-danger d-none" role="alert"></div>
+          <div id="receiveSuccess" class="alert alert-success d-none" role="alert"></div>
+
+          <input type="hidden" id="receipt-id" value="">
+
+          <div class="d-flex justify-content-end gap-2">
+            <button type="submit" class="btn btn-primary" id="confirm-receipt">
+              Confirm receipt & update stock
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Template for a line -->
+<script type="text/template" id="receive-line-template">
+  <div class="row g-2 mb-2 receive-line align-items-center">
+    <div class="col-12 col-md-5">
+      <label class="form-label small d-md-none">Item SKU</label>
+      <select class="form-select form-select-sm r_sku" name="r_sku">
+        <option value="">Select SKU</option>
+        
+          <option value="BISCUITS-200G">BISCUITS-200G — Biscuits 200g</option>
+        
+          <option value="WATER-1.5L">WATER-1.5L — Bottled Water 1.5L</option>
+        
+          <option value="WATER-500ML">WATER-500ML — Bottled Water 500ml</option>
+        
+          <option value="CANDLES-1PC">CANDLES-1PC — Candle (single)</option>
+        
+          <option value="COOK-OIL-10L">COOK-OIL-10L — Cooking Oil 10L</option>
+        
+          <option value="COOK-OIL-1L">COOK-OIL-1L — Cooking Oil 1L</option>
+        
+          <option value="COOK-OIL-20L">COOK-OIL-20L — Cooking Oil 20L</option>
+        
+          <option value="COOK-OIL-2L">COOK-OIL-2L — Cooking Oil 2L</option>
+        
+          <option value="COOK-OIL-5L">COOK-OIL-5L — Cooking Oil 5L</option>
+        
+          <option value="DOWNY-1L">DOWNY-1L — Downy Fabric Softener 1L</option>
+        
+          <option value="DOWNY-500ML">DOWNY-500ML — Downy Fabric Softener 500ml</option>
+        
+          <option value="KIDS-SNACKS-50G">KIDS-SNACKS-50G — Kids Snacks 50g</option>
+        
+          <option value="MATCHBOX-1">MATCHBOX-1 — Matchbox (single)</option>
+        
+          <option value="PAMPERS-L">PAMPERS-L — Pampers Size L</option>
+        
+          <option value="PAMPERS-M">PAMPERS-M — Pampers Size M</option>
+        
+          <option value="PAMPERS-S">PAMPERS-S — Pampers Size S</option>
+        
+          <option value="PAMPERS-XL">PAMPERS-XL — Pampers Size XL</option>
+        
+          <option value="SKU001">SKU001 — Placeholder Item SKU001</option>
+        
+          <option value="ROYCO-50G">ROYCO-50G — Royco Seasoning 50g</option>
+        
+          <option value="SALT-1KG">SALT-1KG — Salt 1kg</option>
+        
+          <option value="SALT-500G">SALT-500G — Salt 500g</option>
+        
+          <option value="SOAP-100G">SOAP-100G — Soap 100g</option>
+        
+          <option value="SOAP-1KG">SOAP-1KG — Soap 1kg</option>
+        
+          <option value="SUGAR-1KG">SUGAR-1KG — Sugar 1kg</option>
+        
+          <option value="TEST-SKU-1">TEST-SKU-1 — TEST-SKU-1</option>
+        
+          <option value="MINUTE MAID 500ML">MINUTE MAID 500ML — minutemaid 500ml</option>
+        
+      </select>
+    </div>
+
+    <div class="col-4 col-md-2">
+      <label class="form-label small d-md-none">Qty</label>
+      <input type="number" class="form-control form-control-sm r_qty" name="r_qty" value="1" min="0.01" step="0.01">
+    </div>
+
+    <div class="col-4 col-md-2">
+      <label class="form-label small d-md-none">Unit</label>
+      <input type="text" class="form-control form-control-sm r_unit" name="r_unit" value="pcs">
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Batch ID</label>
+      <input type="text" class="form-control form-control-sm r_batch" name="r_batch" placeholder="Batch ID (optional)">
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Location</label>
+      <select class="form-select form-select-sm r_location" name="r_location">
+        <option value="">Select location</option>
+        
+          <option value="{&#39;id&#39;: 7, &#39;name&#39;: &#39;Dispatch Bay&#39;}">{&#39;id&#39;: 7, &#39;name&#39;: &#39;Dispatch Bay&#39;}</option>
+        
+          <option value="{&#39;id&#39;: 6, &#39;name&#39;: &#39;Picking Zone&#39;}">{&#39;id&#39;: 6, &#39;name&#39;: &#39;Picking Zone&#39;}</option>
+        
+          <option value="{&#39;id&#39;: 3, &#39;name&#39;: &#39;Rack A Row 1&#39;}">{&#39;id&#39;: 3, &#39;name&#39;: &#39;Rack A Row 1&#39;}</option>
+        
+          <option value="{&#39;id&#39;: 4, &#39;name&#39;: &#39;Rack A Row 2&#39;}">{&#39;id&#39;: 4, &#39;name&#39;: &#39;Rack A Row 2&#39;}</option>
+        
+          <option value="{&#39;id&#39;: 5, &#39;name&#39;: &#39;Rack B Row 1&#39;}">{&#39;id&#39;: 5, &#39;name&#39;: &#39;Rack B Row 1&#39;}</option>
+        
+          <option value="{&#39;id&#39;: 2, &#39;name&#39;: &#39;Receiving Bay&#39;}">{&#39;id&#39;: 2, &#39;name&#39;: &#39;Receiving Bay&#39;}</option>
+        
+      </select>
+    </div>
+
+    <div class="col-6 col-md-3">
+      <label class="form-label small d-md-none">Expiry</label>
+      <input type="date" class="form-control form-control-sm r_expiry" name="r_expiry" placeholder="Expiry">
+    </div>
+
+    <div class="col-2 col-md-1 text-end">
+      <button type="button" class="btn btn-danger btn-sm remove-line" title="Remove line">×</button>
+    </div>
+  </div>
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const linesContainer = document.getElementById('receiveLines');
+  const lineTemplate = document.getElementById('receive-line-template').innerHTML;
+  const alertBox = document.getElementById('receiveAlert');
+  const successBox = document.getElementById('receiveSuccess');
+
+  function addLine() {
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = lineTemplate;
+    linesContainer.appendChild(wrapper.firstElementChild);
+  }
+
+  document.getElementById('addReceiveLine').addEventListener('click', addLine);
+  linesContainer.addEventListener('click', function (e) {
+    if (e.target.classList.contains('remove-line')) {
+      e.target.closest('.receive-line').remove();
+    }
+  });
+
+  addLine();
+
+  function collectLines() {
+    return Array.from(linesContainer.querySelectorAll('.receive-line')).map(row => ({
+      sku: row.querySelector('.r_sku').value,
+      qty: parseFloat(row.querySelector('.r_qty').value) || 0,
+      unit: row.querySelector('.r_unit').value,
+      batch: row.querySelector('.r_batch').value,
+      location: row.querySelector('.r_location').value,
+      expiry: row.querySelector('.r_expiry').value
+    }));
+  }
+
+  function getCsrfToken() {
+    const m = document.querySelector('meta[name="csrf-token"]');
+    return m ? m.getAttribute('content') : null;
+  }
+
+  function showAlert(msg) {
+    alertBox.textContent = msg;
+    alertBox.classList.remove('d-none');
+    successBox.classList.add('d-none');
+  }
+
+  function showSuccess(grnNo, orderRef, emailSent, supplierEmail) {
+    document.getElementById('grn_no').value = grnNo;
+    document.getElementById('po_ref').value = orderRef;
+
+    successBox.innerHTML = '';
+    successBox.classList.remove('d-none');
+    alertBox.classList.add('d-none');
+
+    const msgText = 'Confirmed. GRN ' + grnNo + ' — stock updated.';
+    if (emailSent) {
+      successBox.innerHTML = msgText + ' A PDF copy was emailed to ' + supplierEmail + '.';
+    } else {
+      successBox.innerHTML = msgText + ' No email was sent (damaged/discrepancy).';
+    }
+
+    // Add print and download links
+    const btnRow = document.createElement('div');
+    btnRow.className = 'mt-2 d-flex gap-2';
+
+    const printBtn = document.createElement('a');
+    printBtn.href = '/receipt/' + encodeURIComponent(grnNo);
+    printBtn.target = '_blank';
+    printBtn.className = 'btn btn-sm btn-outline-dark';
+    printBtn.textContent = 'Print GRN';
+
+    const downloadBtn = document.createElement('a');
+    downloadBtn.href = '/receive/' + encodeURIComponent(grnNo) + '/pdf';
+    downloadBtn.target = '_blank';
+    downloadBtn.className = 'btn btn-sm btn-outline-primary';
+    downloadBtn.textContent = 'Download PDF';
+
+    btnRow.appendChild(printBtn);
+    btnRow.appendChild(downloadBtn);
+    successBox.appendChild(btnRow);
+  }
+
+  document.getElementById('receiveForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+
+    const payload = {
+      receipt_id: document.getElementById('receipt-id').value || null,
+      supplier: document.getElementById('supplier').value,
+      supplier_email: document.getElementById('supplier_email').value,
+      po_ref: document.getElementById('po_ref').value,
+      condition: document.getElementById('condition_check').value,
+      condition_notes: document.getElementById('condition_notes').value,
+      lines: collectLines(),
+      confirmed_by: window.currentUser || 'web'
+    };
+
+    if (!payload.supplier || !payload.supplier_email) {
+      showAlert('Supplier and email are required.');
+      return;
+    }
+    if (payload.lines.length === 0 || payload.lines.every(l => !l.sku)) {
+      showAlert('Add at least one received line.');
+      return;
+    }
+
+    const btn = document.getElementById('confirm-receipt');
+    btn.disabled = true;
+    btn.textContent = 'Confirming...';
+
+    const headers = { 'Content-Type': 'application/json' };
+    const csrf = getCsrfToken();
+    if (csrf) headers['X-CSRFToken'] = csrf;
+
+    fetch('/api/receive', { method: 'POST', headers, body: JSON.stringify(payload) })
+      .then(r => r.json())
+      .then(j => {
+        btn.disabled = false;
+        btn.textContent = 'Confirm receipt & update stock';
+
+        if (j.status !== 'ok') {
+          showAlert('Error: ' + (j.message || 'Unknown error.'));
+          return;
+        }
+
+        showSuccess(j.grn_no, j.order_ref, j.email_sent, payload.supplier_email);
+        // Store receipt id for print/download
+        document.getElementById('receipt-id').value = j.receipt_id;
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.textContent = 'Confirm receipt & update stock';
+        showAlert('Network error: ' + err);
+      });
+  });
+});
+</script>
+
+      </main>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

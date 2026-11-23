@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <title>Delivery Note {{ tx.delivery_no }}</title>
+</head>
+<body class="p-3">
+  <div class="d-flex justify-content-between">
+    <div>
+      <h5>Busia County Warehouse</h5>
+      <div>Delivery Note: <strong>{{ tx.delivery_no }}</strong></div>
+      <div>Order / PO Ref: {{ tx.order_ref or '' }}</div>
+    </div>
+    <div class="text-end">
+      <div>Date: {{ tx.created_at }}</div>
+      <div>Recipient: {{ tx.recipient or '' }}</div>
+      {% if tx.recipient_phone %}<div>Phone: {{ tx.recipient_phone }}</div>{% endif %}
+      {% if tx.recipient_email %}<div>Email: {{ tx.recipient_email }}</div>{% endif %}
+      {% if tx.address %}<div>Address: {{ tx.address }}</div>{% endif %}
+    </div>
+  </div>
+  <hr>
+  <table class="table table-sm">
+    <thead>
+      <tr><th>SKU</th><th>Description</th><th>Batch</th><th class="text-end">Qty</th><th>Location</th></tr>
+    </thead>
+    <tbody>
+      {% for l in lines %}
+      <tr>
+        <td>{{ l.sku }}</td>
+        <td>{{ l.name or '' }}</td>
+        <td>{{ l.batch_id or '' }}</td>
+        <td class="text-end">{{ l.qty }}</td>
+        <td>{{ l.location or '' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-center text-muted">No lines recorded</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if tx.remarks %}
+  <div class="mt-2"><strong>Remarks:</strong> {{ tx.remarks }}</div>
+  {% endif %}
+
+  <div class="mt-4 row">
+<div class="col-6">Driver: {{ tx.driver_name or '' }}{% if tx.driver_phone %} ({{ tx.driver_phone }}){% endif %}</div>    
+<div class="col-6">Vehicle: {{ tx.vehicle_reg or '' }}</div>
+  </div>
+
+  <div class="mt-4">Prepared by: {{ tx.created_by or '' }}</div>
+  <div class="mt-4">Recipient signature: ____________________ &nbsp;&nbsp; Date: ____________</div>
+
+  <div class="mt-3 no-print">
+    <a href="/issue/{{ tx.id }}/pdf" class="btn btn-sm btn-outline-primary">Download PDF</a>
+  </div>
+
+  <style>
+    @media print { .no-print { display: none; } }
+  </style>
+  <script>window.print()</script>
+</body>
+</html>

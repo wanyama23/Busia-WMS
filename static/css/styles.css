@@ -1,0 +1,84 @@
+:root{
+  --sidebar-width: 260px;
+  --brand-color: #0d6efd;
+  --bg-main: #f6f8fb;
+  --card-bg: #ffffff;
+  --muted: #6c757d;
+}
+
+* { box-sizing: border-box; }
+
+.app-shell { min-height:100vh; }
+
+.sidebar{
+  width:var(--sidebar-width);
+  min-height:100vh;
+  position:fixed;
+  left:0;
+  top:0;
+  bottom:0;
+  overflow:auto;
+  background:#0b1220;
+  color:#fff;
+  padding-bottom:1rem;
+}
+
+.sidebar .sidebar-brand h5 { color:#fff; margin-bottom:0.15rem; }
+.sidebar .sidebar-brand small { color:rgba(255,255,255,0.6); }
+
+.sidebar .nav-link {
+  color: rgba(255,255,255,0.9);
+  padding: .55rem .75rem;
+  border-radius: 6px;
+  margin: 0.15rem 0;
+}
+.sidebar .nav-link:hover { background: rgba(255,255,255,0.03); color:#fff; text-decoration:none; }
+
+.main{
+  margin-left:var(--sidebar-width);
+  min-height:100vh;
+  background:var(--bg-main);
+}
+
+.topbar{
+  background:var(--card-bg);
+  box-shadow: 0 1px 0 rgba(0,0,0,0.04);
+}
+
+.summary-card{
+  border-left: 4px solid var(--brand-color);
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 60%, #eef6ff 100%);
+  height:100%;
+  transition: transform .12s ease, box-shadow .12s ease;
+  box-shadow: 0 1px 4px rgba(13,110,253,0.04);
+  border-radius: 8px;
+}
+
+.summary-card:hover{
+  transform: translateY(-4px);
+  box-shadow: 0 8px 24px rgba(13,110,253,0.06);
+}
+
+.card { border-radius: 8px; border: none; }
+.card .card-header { background: #fff; border-bottom: 1px solid #eef2f6; font-weight:600; }
+
+.list-group-item { padding: 0.9rem 1.25rem; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #f1f4f8; }
+
+.text-muted.small { color: var(--muted); font-size:0.85rem; }
+
+.btn-outline-secondary { color:#495057; border-color:#dfe6ef; }
+.btn-outline-secondary:hover { background:#f1f5fb; }
+
+@media (max-width: 767px){
+  .sidebar{ position:relative; width:100%; min-height:auto; }
+  .main{ margin-left:0; }
+  .summary-card .display-6 { font-size:1.25rem; }
+}
+
+
+
+.item-card .card { border-radius: 8px; }
+.item-card .card-body { padding: 12px; }
+.item-card .fw-bold { font-size: 1rem; }
+.badge.bg-danger { background-color: #dc3545; }
+.card .btn { font-size: 0.8rem; padding: 0.35rem 0.6rem; }
